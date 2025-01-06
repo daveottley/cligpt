@@ -7,7 +7,7 @@ MODEL = "o1-mini"
 MAX_COMPLETION_TOKENS = 5_000
 N = 1
 PRESENCE_PENALTY = 0
-SYSTEM_MESSAGE_FILE = "/home/daveottley/scripts/python/cligpt/system_message.txt"
+SYSTEM_MESSAGE_FILE = "system_message.txt"
 EDITOR_ENV_VARS = [
     "VIM",
     "VIMRUNTIME",
