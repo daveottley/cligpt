@@ -50,10 +50,12 @@ you can ask `gpt` itself for its configuration.
 ### Example
 
 ```bash
-gpt rewrite python to dynamically detect user environment "$(cat cligpt.py)" > response.txt
+gpt rewrite python to dynamically detect user environment: "$(cat cligpt.py)" > response.txt
 ```
 
-**Explanation:** This will take your input file `cligpt.py` and rewrite it in
+**Explanation:** The colon after your goal is required here. It tells gpt
+that what comes before is your goal and what comes after is yoru code.
+This command will take your input file `cligpt.py` and rewrite it in
 valid Python to dynamically detect the user environment. This output will have
 no formatting or explanation, so it is suggested first to query `gpt` without
 an explicit language to read any comments about edits that it may have. Once
