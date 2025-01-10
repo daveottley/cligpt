@@ -5,7 +5,7 @@ from openai import OpenAI
 import textwrap
 
 MODEL = "o1-preview"
-MAX_COMPLETION_TOKENS = 20_000
+MAX_COMPLETION_TOKENS = 32_000
 N = 1
 PRESENCE_PENALTY = 0
 SYSTEM_MESSAGE_FILE = "system_message.txt"
@@ -86,19 +86,97 @@ def single_query(user_prompt):
     return answers
 
 def repl_mode():
-    """Start a REPL loop, sending user input to OpenAI until 'exit' or 'quit'."""
-    print("Entering REPL mode. Type 'exit' or 'quit' to leave.")
-    while True:
-        user_prompt = input(">>> ")
-        if user_prompt.lower() in ["exit", "quit"]:
-            print("Exiting REPL mode.")
-            break
-        if user_prompt.strip() == "":
-            continue  # Skip empty lines
-        response_text = single_query(user_prompt)
-        print(response_text)
-        print("-" * 40)  # Separator after each response
+    """
+    Start a REPL loop, sending user input to OpenAI until 'exit' or 'quit'.
+    Logs conversation in real time to a file named:
+        REPL-conversation-<YYYY-MM-DD>-<HHMMSS>.txt
+    The file is stored in conversations/ relative to cligpt.py.
+    If the user exits normally, the special investigation line is removed.
+    """
+    import datetime
+    import os
 
+    now = datetime.datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H%M%S")
+
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    conv_dir = os.path.join(script_dir, "conversations")
+    os.makedirs(conv_dir, exist_ok=True)
+
+    log_file_path = os.path.join(
+        conv_dir,
+        f"REPL-conversation-{date_str}-{time_str}.txt"
+    )
+
+    # Write the special investigation line once at file creation
+    with open(log_file_path, "w", encoding="utf-8") as f:
+        f.write(
+            "--cligpt.py SHUT DOWN UNEXPECTEDLY!! THIS LINE SHOULD NOT "
+            "BE HERE. Investigate.\n"
+        )
+
+    # Open file for real-time logging
+    log_file = open(log_file_path, "a", encoding="utf-8")
+
+    # Track normal exit
+    normal_exit = False
+
+    intro_line = "Entering REPL mode. Type 'exit' or 'quit' to leave."
+    print(intro_line)
+    log_file.write(intro_line + "\n")
+    log_file.flush()
+
+    try:
+        while True:
+            user_prompt = input(">>> ")
+            log_file.write(f">>> {user_prompt}\n")
+            log_file.flush()
+
+            if user_prompt.lower() in ["exit", "quit"]:
+                exit_line = "Exiting REPL mode."
+                print(exit_line)
+                log_file.write(exit_line + "\n")
+                normal_exit = True
+                break
+
+            if user_prompt.strip() == "":
+                continue
+
+            all_answers = single_query(user_prompt)
+            if not all_answers:
+                continue
+
+            if len(all_answers) == 1:
+                print(all_answers[0])
+                log_file.write(all_answers[0] + "\n")
+            else:
+                for i, ans in enumerate(all_answers, start=1):
+                    numbered_ans = f"Answer {i}:\n{ans}\n{'-' * 40}"
+                    print(numbered_ans)
+                    log_file.write(numbered_ans + "\n")
+
+            sep_line = "-" * 40
+            print(sep_line)
+            log_file.write(sep_line + "\n")
+            log_file.flush()
+
+    finally:
+        log_file.close()
+
+        # If normal exit, remove the special investigation line
+        if normal_exit:
+            with open(log_file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            # Filter out the special line
+            filtered_lines = [
+                ln for ln in lines
+                if not ln.startswith(
+                    "--cligpt.py SHUT DOWN UNEXPECTEDLY!! THIS LINE"
+                )
+            ]
+            with open(log_file_path, "w", encoding="utf-8") as f:
+                f.writelines(filtered_lines)
 def main():
     if not client.api_key:
         print("Please set the OPENAI_API_KEY environment variable.")
