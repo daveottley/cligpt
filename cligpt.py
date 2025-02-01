@@ -4,7 +4,7 @@ import platform
 from openai import OpenAI
 import textwrap
 
-MODEL = "o1-preview"
+MODEL = "o3-mini"
 MAX_COMPLETION_TOKENS = 32_000
 N = 1
 PRESENCE_PENALTY = 0
