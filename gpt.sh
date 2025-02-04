@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 function gpt() {
   (
     setopt localoptions noglob
