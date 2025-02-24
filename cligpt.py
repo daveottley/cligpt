@@ -7,16 +7,17 @@ from openai import OpenAI
 import textwrap
 
 MODEL = "o3-mini"
-MAX_COMPLETION_TOKENS = 32_000
+STREAM = True
+# MAX_COMPLETION_TOKENS = 32_000
 N = 1
 PRESENCE_PENALTY = 0
 SYSTEM_MESSAGE_FILE = "system_message.txt"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def single_query(user_prompt):
+def single_query(user_prompt, reasoning_effort="medium"):
     """
-    Send a single query to OpenAI and return the response text.
+    Send a single query to OpenAI with the given reasoning_effort and return the response text.
     """
 
     # Detect the operating system and version
@@ -26,12 +27,10 @@ def single_query(user_prompt):
     # Detect the distribution name (for Linux systems)
     if operating_system == "Linux":
         try:
-            # Try to import the 'distro' module for detailed info
             import distro
             distribution = distro.name()
             version = distro.version()
         except ImportError:
-            # Fallback if 'distro' is not available
             distribution = "Linux"
     else:
         distribution = operating_system
@@ -47,7 +46,6 @@ def single_query(user_prompt):
     with open(SYSTEM_MESSAGE_FILE, "r", encoding="utf-8") as f:
         system_message_template = f.read().strip()
 
-    # Fill placeholders with dynamically detected environment variables
     SYSTEM_MESSAGE = system_message_template.format(
         distribution=distribution,
         operating_system=operating_system,
@@ -56,44 +54,41 @@ def single_query(user_prompt):
         editor=editor
     ).strip()
 
-    # Combine the system and user prompt to comply with new API
-    combined_prompt = f"{SYSTEM_MESSAGE}\n\n{user_prompt}"
+    # Build the chat completion from a developer and a user message
     response = client.chat.completions.create(
         model=MODEL,
+        reasoning_effort=reasoning_effort,
         messages=[
-            {"role": "user", "content": combined_prompt},
+            {"role": "developer", "content": SYSTEM_MESSAGE},
+            {"role": "user", "content": user_prompt}
         ],
-        max_completion_tokens=MAX_COMPLETION_TOKENS,
+        # max_completion_tokens=MAX_COMPLETION_TOKENS,
         n=N,
-        presence_penalty=PRESENCE_PENALTY
+        presence_penalty=PRESENCE_PENALTY,
+        stream=STREAM,
+        store=True
     )
 
-    # Return a list of stripped message content
     answers = []
-    for choice in response.choices:
-        finish_reason = choice.finish_reason
-        content = choice.message.content.strip()
-        answers.append(content)
-        # If the content is empty, print the finish reason for the user
-        if not content:
-            print(
-                textwrap.fill(
-                    f"Received empty content from the model. "
-                    f"The reason given was: {finish_reason}",
-                    width=79
-                )
-            )
-            return None
+    message_chunks = []
 
+    # Stream and print each chunk immediately
+    for chunk in response:
+        chunk_message = chunk.choices[0].delta.content
+        if chunk_message:
+            sys.stdout.write(chunk_message)
+            sys.stdout.flush()
+            message_chunks.append(chunk_message)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+    message_content = ''.join(message_chunks)
+    answers.append(message_content)
     return answers
 
 def repl_mode():
     """
-    Start a REPL loop, sending user input to OpenAI until 'exit' or 'quit'.
-    Logs conversation in real time to a file named:
-        REPL-conversation-<YYYY-MM-DD>-<HHMMSS>.txt
-    The file is stored in conversations/ relative to cligpt.py.
-    If the user exits normally, the special investigation line is removed.
+    Start a REPL loop. In REPL mode, the reasoning_effort is set to the default "medium".
     """
     import datetime
     import os
@@ -111,17 +106,13 @@ def repl_mode():
         f"REPL-conversation-{date_str}-{time_str}.txt"
     )
 
-    # Write the special investigation line once at file creation
     with open(log_file_path, "w", encoding="utf-8") as f:
         f.write(
             "--cligpt.py SHUT DOWN UNEXPECTEDLY!! THIS LINE SHOULD NOT "
             "BE HERE. Investigate.\n"
         )
 
-    # Open file for real-time logging
     log_file = open(log_file_path, "a", encoding="utf-8")
-
-    # Track normal exit
     normal_exit = False
 
     intro_line = "Entering REPL mode. Type 'exit' or 'quit' to leave."
@@ -145,7 +136,7 @@ def repl_mode():
             if user_prompt.strip() == "":
                 continue
 
-            all_answers = single_query(user_prompt)
+            all_answers = single_query(user_prompt, reasoning_effort="medium")
             if not all_answers:
                 continue
 
@@ -165,12 +156,9 @@ def repl_mode():
 
     finally:
         log_file.close()
-
-        # If normal exit, remove the special investigation line
         if normal_exit:
             with open(log_file_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
-            # Filter out the special line
             filtered_lines = [
                 ln for ln in lines
                 if not ln.startswith(
@@ -179,24 +167,37 @@ def repl_mode():
             ]
             with open(log_file_path, "w", encoding="utf-8") as f:
                 f.writelines(filtered_lines)
+
 def main():
     if not client.api_key:
         print("Please set the OPENAI_API_KEY environment variable.")
         sys.exit(1)
 
-    # If we have arguments, run single response mode; otherwise, drop into REPL
+    # If arguments are provided, process the flag and prompt.
     if len(sys.argv) > 1:
-        user_prompt = " ".join(sys.argv[1:])
-        all_answers = single_query(user_prompt)
-        if len(all_answers) == 1:
-            # Only one answer returned
-            print(all_answers[0])
+        # Check if the first argument is a reasoning flag.
+        arg0 = sys.argv[1].lower()
+        if arg0 in ["-high", "-medium", "-low"]:
+            if arg0 == "-high":
+                reasoning_effort = "high"
+            elif arg0 == "-low":
+                reasoning_effort = "low"
+            else:
+                reasoning_effort = "medium"
+            user_prompt = " ".join(sys.argv[2:])
         else:
-            # Display each answer, let the user pick
-            for i, ans in enumerate(all_answers, start=1):
-                print(f"Answer {i}:\n{ans}\n{'-' * 40}")
+            reasoning_effort = "medium"
+            user_prompt = " ".join(sys.argv[1:])
+        all_answers = single_query(user_prompt, reasoning_effort)
+        if not STREAM :
+            if len(all_answers) == 1:
+                print(all_answers[0])
+            else:
+                for i, ans in enumerate(all_answers, start=1):
+                    print(f"Answer {i}:\n{ans}\n{'-' * 40}")
     else:
         repl_mode()
 
 if __name__ == "__main__":
     main()
+
