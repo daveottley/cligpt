@@ -141,7 +141,7 @@ def repl_mode():
                 continue
 
             if len(all_answers) == 1:
-                print(all_answers[0])
+                # print(all_answers[0])
                 log_file.write(all_answers[0] + "\n")
             else:
                 for i, ans in enumerate(all_answers, start=1):
