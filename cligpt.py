@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import sys
 import os
 import platform
@@ -7,6 +8,9 @@ import re
 import subprocess
 import json
 from openai import OpenAI
+
+# Global debug flag (default off)
+DEBUG = False
 
 # Constants
 MODEL = "o3-mini"
@@ -49,6 +53,7 @@ RESPONSE_SCHEMA = {
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+
 def perform_command_substitution(input_text):
     """
     Perform command substitution on the input text.
@@ -66,6 +71,7 @@ def perform_command_substitution(input_text):
             return f"<error executing command: {cmd}>"
 
     return pattern.sub(replace, input_text)
+
 
 def get_relevant_tags(prompt):
     """
@@ -93,6 +99,7 @@ def get_relevant_tags(prompt):
     except Exception:
         return []
 
+
 def prune_context_by_topic(current_prompt):
     """
     Parse context.txt and return blocks that are either recent (within the last hour) or, if older,
@@ -108,7 +115,7 @@ def prune_context_by_topic(current_prompt):
     blocks = content.split(DELIMITER)
     now = datetime.datetime.now()
 
-    # Collect all unique topic tags from the context for older blocks 
+    # Collect all unique topic tags from the context for older blocks
     all_tags = set()
     for block in blocks:
         m = re.search(r"topic tags:\s*(.*)", block, re.IGNORECASE)
@@ -122,10 +129,8 @@ def prune_context_by_topic(current_prompt):
     # Query FAST_MODEL for matching tags based on the current prompt
     if all_tags_list:
         query = (
-            "Given the following list of topic tags:\n"
-            f"{', '.join(all_tags_list)}\n"
-            "Return exactly a JSON array of the tags that softly match the current prompt: "
-            f"{current_prompt}"
+            "Given the following list of topic tags:\n" + ", ".join(all_tags_list) + "\n" +
+            "Return exactly a JSON array of the tags that softly match the current prompt: " + current_prompt
         )
         messages = [
             {"role": "system", "content": "You are a tag matching assistant. Return exactly a JSON array of tags that softly match the prompt."},
@@ -196,12 +201,13 @@ def prune_context_by_topic(current_prompt):
             try:
                 t = datetime.datetime.strptime(m_time.group(1), "%Y-%m-%d %H:%M:%S")
                 if oldest is None or t < oldest:
-                    oldest =  t
+                    oldest = t
             except Exception:
                 pass
     oldest_block = oldest.strftime("%Y-%m-%d %H:%M:%S") if oldest else "None"
 
     return pruned_context, len(selected_blocks), topic_tags, oldest_block
+
 
 def single_query(user_prompt, reasoning_effort="medium"):
     """
@@ -255,8 +261,10 @@ def single_query(user_prompt, reasoning_effort="medium"):
         f"    [Oldest Block: {oldest_block}]\n"
         f"  [User Prompt: {user_tokens}]\n"
     )
-    sys.stdout.write(header)
-    sys.stdout.flush()
+    # Only print header if debug mode is active
+    if DEBUG:
+        sys.stdout.write(header)
+        sys.stdout.flush()
 
     # Combine system message and pruned context for a comprehensive system prompt
     combined_system = SYSTEM_MESSAGE + "\n\n" + PRUNED_CONTEXT
@@ -283,7 +291,7 @@ def single_query(user_prompt, reasoning_effort="medium"):
         # Log the entire delta as a dict for debugging
         delta_dict = chunk.choices[0].delta.model_dump()
         # print("Received chunk delta:", delta_dict)
-        
+
         delta = chunk.choices[0].delta
         if delta:
             chunk_message = delta.content if delta.content is not None else ""
@@ -310,15 +318,15 @@ def single_query(user_prompt, reasoning_effort="medium"):
     #######################
     ### Write to stdout ###
     #######################
-    
-    header = f"  [Reasoning Tokens: {reasoning_tokens_used}]\n"
-    # Check and print finish_reason if available
+
+    header2 = f"  [Reasoning Tokens: {reasoning_tokens_used}]\n"
     finish_reason = chunk.choices[0].finish_reason
     if finish_reason is not None:
-        header += f"[Finish reason: {finish_reason}]"
-    header += "\n"
-        
-    full_output = header + "\n" + answer_text
+        header2 += f"[Finish reason: {finish_reason}]"
+    header2 += "\n"
+
+    # Prepend each response from the model with (reasoning_effort)
+    full_output = (header2 if DEBUG else "") + f"({reasoning_effort}) " + answer_text
     sys.stdout.write(full_output + "\n")
     sys.stdout.flush()
 
@@ -334,7 +342,9 @@ def single_query(user_prompt, reasoning_effort="medium"):
 
     return full_output
 
+
 def repl_mode(reasoning_effort="medium"):
+    global DEBUG
     now = datetime.datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M%S")
@@ -346,12 +356,18 @@ def repl_mode(reasoning_effort="medium"):
         f.write("--cligpt.py SHUT DOWN UNEXPECTEDLY!! THIS LINE SHOULD NOT BE HERE. Investigate.\n")
     log_file = open(log_file_path, "a", encoding="utf-8")
     normal_exit = False
-    intro_line = (
-        "Entering REPL mode. Type 'exit' or 'quit' to leave.\n"
-        "To change the default reasoning effort, prefix your message with a flag (-high, -medium, -low)."
-    )
+    intro_line = "Entering REPL mode."
     print(intro_line)
     log_file.write(intro_line + "\n")
+
+    # Additional line to show current reasoning effort
+    extra_line = f"Reasoning effor set to: {reasoning_effort.upper()}"
+    print(extra_line)
+    log_file.write(extra_line + "\n")
+
+    second_line = "To change the default reasoning effort, prefix your message with a flag (-high, -medium, -low)."
+    print(second_line)
+    log_file.write(second_line + "\n")
     log_file.flush()
 
     try:
@@ -369,6 +385,7 @@ def repl_mode(reasoning_effort="medium"):
             if user_prompt.strip() == "":
                 continue
             tokens = user_prompt.split()
+            # Check for reasoning effort flags
             if tokens and tokens[0].lower() in ["-high", "-medium", "-low"]:
                 new_flag = tokens[0].lower()
                 if new_flag == "-high":
@@ -386,6 +403,21 @@ def repl_mode(reasoning_effort="medium"):
                     continue
                 else:
                     user_prompt = " ".join(tokens[1:])
+
+            # Check for debug toggle commands
+            if tokens and tokens[0].lower() == "+debug":
+                DEBUG = True
+                confirmation = "Debug mode activated."
+                print(confirmation)
+                log_file.write(confirmation + "\n")
+                continue
+            if tokens and tokens[0].lower() == "-debug":
+                DEBUG = False
+                confirmation = "Debug mode deactivated."
+                print(confirmation)
+                log_file.write(confirmation + "\n")
+                continue
+
             single_query(user_prompt, reasoning_effort)
             log_file.write(DELIMITER)
             log_file.flush()
@@ -397,6 +429,7 @@ def repl_mode(reasoning_effort="medium"):
             filtered_lines = [ln for ln in lines if not ln.startswith("--cligpt.py SHUT DOWN UNEXPECTEDLY!!")]
             with open(log_file_path, "w", encoding="utf-8") as f:
                 f.writelines(filtered_lines)
+
 
 def main():
     if not client.api_key:
@@ -420,6 +453,6 @@ def main():
     else:
         single_query(user_prompt, reasoning_effort)
 
+
 if __name__ == "__main__":
     main()
-
