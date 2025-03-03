@@ -1,3 +1,6 @@
 conversations/
 .venv/
 context.txt
+*.bak
+*.old
+__pycache__/
