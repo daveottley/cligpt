@@ -15,7 +15,7 @@ CONTEXT_FILE = "context.txt"
 PERMANENT_MEMORY_FILE = "permanent_memory.json"  # permanent memories stored here
 
 # Token limit for assembling context
-MAX_CONTEXT_TOKENS = 150_000
+MAX_CONTEXT_TOKENS = 100_000
 
 # Delimiter for context blocks
 DELIMITER = "\n" + "-" * 15 + "\n"

@@ -7,8 +7,13 @@ import datetime
 import json
 import re
 from openai import OpenAI
-from config import MODEL, FAST_MODEL, PRESENCE_PENALTY, SYSTEM_MESSAGE_FILE
-from memory_manager import prune_context, add_to_context, estimate_tokens
+from config import MAX_CONTEXT_TOKENS, MODEL, FAST_MODEL, PRESENCE_PENALTY, SYSTEM_MESSAGE_FILE
+from memory_manager import (
+        get_neofetch_output,
+        prune_context,
+        add_to_context,
+        estimate_tokens
+)
 import time
 
 # Initialize OpenAI client
@@ -21,10 +26,7 @@ RESPONSE_SCHEMA = {
     "schema": {
         "type": "object",
         "properties": {
-            "answer": {
-                "type": "string",
-                "description": "The answer text."
-            },
+            "answer": {"type": "string", "description": "The answer text."},
             "topics": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -58,18 +60,32 @@ def load_system_message():
     editor = os.getenv("EDITOR", "unknown")
     with open(SYSTEM_MESSAGE_FILE, "r", encoding="utf-8") as f:
         template = f.read().strip()
-    return template.format(
+    
+    # Get neofetch output
+    neofetch_info = get_neofetch_output()
+
+    # Format the system message and append neofetch info.
+    formatted_message = template.format(
         distribution=distribution,
         operating_system=operating_system,
         version=version,
         shell=shell,
         editor=editor
     ).strip()
+    
+    return formatted_message + "\n\n" + neofetch_info
 
 def single_query(user_prompt, reasoning_effort="medium", debug=False):
     """
-    Send a query to the AI, assembling context from permanent and recent history.
+    Send a query to the AI using the specified reasoning effort.
+    A header is printed at the beginning of each response:
+      [<model_name> - <reasoning_effort>]
+    Streaming is disabled.
     """
+    # Default reasoning_effort to "medium" if not provided.
+    if not reasoning_effort:
+        reasoning_effort = "medium"
+
     system_message = load_system_message()
     pruned_context, chat_blocks, topic_tags, oldest_block = prune_context(user_prompt)
     
@@ -79,20 +95,22 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False):
     context_tokens = estimate_tokens_local(pruned_context)
     user_tokens = estimate_tokens_local(user_prompt)
     total_context_tokens = system_tokens + context_tokens + user_tokens
+
+    # Build header
+    header_basic = f"[{MODEL} - {reasoning_effort}]"
+    debug_header = (f"[Context Tokens: {total_context_tokens}]\n"
+                    f"  [System Message: {system_tokens}]\n"
+                    f"  [Pruned Context: {context_tokens}]\n"
+                    f"    [Chat Blocks: {chat_blocks}]\n"
+                    f"    [Topic Tags: {topic_tags}]\n"
+                    f"    [Oldest Block: {oldest_block}]\n"
+                    f"  [User Prompt: {user_tokens}]\n")
     
-    header = (
-        f"[Reasoning: {reasoning_effort}]\n"
-        f"[Context Tokens: {total_context_tokens}]\n"
-        f"  [System Message: {system_tokens}]\n"
-        f"  [Pruned Context: {context_tokens}]\n"
-        f"    [Chat Blocks: {chat_blocks}]\n"
-        f"    [Topic Tags: {topic_tags}]\n"
-        f"    [Oldest Block: {oldest_block}]\n"
-        f"  [User Prompt: {user_tokens}]\n"
-    )
     if debug:
-        sys.stdout.write(header)
-        sys.stdout.flush()
+        sys.stdout.write(header_basic + "\n" + debug_header)
+    else:
+        sys.stdout.write(header_basic + "\n")
+    sys.stdout.flush()
         
     combined_system = system_message + "\n\n" + pruned_context
     messages = [
@@ -100,26 +118,22 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False):
         {"role": "user", "content": user_prompt}
     ]
     
+    # Always disable streaming.
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
+        max_completion_tokens=MAX_CONTEXT_TOKENS,
         response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
         n=1,
         presence_penalty=PRESENCE_PENALTY,
-        stream=True,
+        stream=False,
         store=True
     )
     
-    message_chunks = []
-    for chunk in response:
-        delta = chunk.choices[0].delta
-        if delta:
-            chunk_message = delta.content if delta.content is not None else ""
-            if not chunk_message and hasattr(delta, "function_call"):
-                chunk_message = delta.function_call.arguments if delta.function_call and delta.function_call.arguments is not None else ""
-            message_chunks.append(chunk_message)
-    raw_content = "".join(message_chunks)
+    raw_content = response.choices[0].message.content
     
+    if raw_content is None:
+        raw_content = ""
     try:
         structured_output = json.loads(raw_content)
     except json.JSONDecodeError:
@@ -133,12 +147,15 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False):
     topics = structured_output.get("topics", [])
     reasoning_tokens_used = structured_output.get("reasoning_tokens", 0)
     
-    header2 = f"  [Reasoning Tokens: {reasoning_tokens_used}]\n"
-    full_output = header2 + "\n" + answer_text
-    sys.stdout.write(full_output + "\n")
+    if debug:
+        header2 = f"[Reasoning Tokens: {reasoning_tokens_used}]\n"
+        full_output = header2 + "\n" + answer_text
+    else:
+        full_output = answer_text
+
+    sys.stdout.write("\n" + full_output + "\n")
     sys.stdout.flush()
     
-    # Append this interaction to context.
-    add_to_context(user_prompt, answer_text, topics)
+    add_to_context(user_prompt, answer_text, topics, reasoning_effort)
     return full_output
 

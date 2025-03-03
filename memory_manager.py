@@ -4,7 +4,18 @@ import os
 import datetime
 import re
 import json
-from config import CONTEXT_FILE, PERMANENT_MEMORY_FILE, DELIMITER, MAX_CONTEXT_TOKENS
+import subprocess
+from config import MODEL, CONTEXT_FILE, PERMANENT_MEMORY_FILE, DELIMITER, MAX_CONTEXT_TOKENS
+
+REQUIRED_PERMANENT_MEMORIES = ["name", "topics_of_interest"]
+
+def get_neofetch_output():
+    try:
+        # Run neofetch with the --stdout flag to capture its output.
+        output = subprocess.check_output(["neofetch", "--stdout"], text=True)
+        return output
+    except Exception as e:
+        return f"Neofetch output unavailable: {e}"
 
 def estimate_tokens(text):
     """Estimate token count by splitting text on whitespace."""
@@ -39,24 +50,44 @@ def save_permanent_memories(memories):
     with open(PERMANENT_MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memories, f, indent=2)
 
-def add_permanent_memory(text):
-    """Add a text block to permanent memory with a timestamp.
+def add_permanent_memory(memory_data):
+    # If a string is passed, require a colon-separated key-value pair.
+    if isinstance(memory_data, str):
+        if ':' not in memory_data:
+            raise ValueError("Permanent memory must be provided in 'key: value' format.")
+        key, value = memory_data.split(':', 1)
+        key = key.strip()
+        value = value.strip()
+        memory_data = {key: value}
     
-    This entry will be exempt from pruning.
-    """
     memories = load_permanent_memories()
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    entry = {"id": len(memories) + 1, "timestamp": timestamp, "text": text}
+    entry = {"id": len(memories) + 1, "timestamp": timestamp}
+    entry.update(memory_data)
     memories.append(entry)
     save_permanent_memories(memories)
     return entry
+
+def ensure_required_permanent_memories():
+    memories = load_permanent_memories()
+    for key in REQUIRED_PERMANENT_MEMORIES:
+        # Check if any memory entry contains this key.
+        if not any(key in mem for mem in memories):
+            # If not, prompt the user for the value.
+            value = input(f"Permanent memory for '{key}' not found. Please provide your {key}: ")
+            add_permanent_memory({key: value})
+            print(f"Added permanent memory for '{key}'.")
 
 def view_permanent_memory():
     """Return a list of permanent memory entries as formatted strings."""
     memories = load_permanent_memories()
     lines = []
     for mem in memories:
-        lines.append(f"[{mem['id']}] ({mem['timestamp']}) {mem['text']}")
+        display_text = mem.get("text")
+        if not display_text:
+            # Combine all keys except 'id' and 'timestamp'
+            display_text = "; ".join(f"{k}: {v}" for k, v in mem.items() if k not in ("id", "timestamp"))
+        lines.append(f"[{mem['id']}] ({mem['timestamp']}) {display_text}")
     return lines
 
 def forget_permanent_memory(entry_id):
@@ -93,7 +124,13 @@ def prune_context(user_prompt):
     permanent_memories = load_permanent_memories()
     perm_texts = []
     for mem in permanent_memories:
-        perm_texts.append(f"[{mem['timestamp']}] (PERMANENT) {mem['text']}")
+        if "text" in mem:
+            text_value = mem["text"]
+        else:
+            # Combine any keys besides 'id' and 'timestamp'
+            other_keys = [f"{k}: {v}" for k, v in mem.items() if k not in ("id", "timestamp")]
+            text_value = "; ".join(other_keys)
+        perm_texts.append(f"[{mem['timestamp']}] (PERMANENT) {text_value}")
     permanent_context = "\n".join(perm_texts)
 
     blocks = load_context_blocks()
@@ -141,12 +178,12 @@ def prune_context(user_prompt):
             oldest_timestamp = min(times).strftime("%Y-%m-%d %H:%M:%S")
     return pruned_context, len(selected_blocks), topic_tags, oldest_timestamp
 
-def add_to_context(user_prompt, answer_text, topics):
+def add_to_context(user_prompt, answer_text, topics, reasoning_effort="medium"):
     """
     Append a new conversation block to the context file.
     """
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     topics_str = ", ".join(topics) if topics else "None"
-    block = f"[{timestamp}] >>> {user_prompt}\n[Response] {answer_text}\nTopic Tags: {topics_str}"
+    block = f"[{timestamp}]\n>>> {user_prompt}\n[{MODEL} - {reasoning_effort}] {answer_text}\nTopic Tags: {topics_str}"
     save_context_block(block)
 
