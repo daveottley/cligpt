@@ -1,5 +1,6 @@
 # memory_manager.py
 
+import sys
 import os
 import datetime
 import re
@@ -54,7 +55,9 @@ def add_permanent_memory(memory_data):
     # If a string is passed, require a colon-separated key-value pair.
     if isinstance(memory_data, str):
         if ':' not in memory_data:
-            raise ValueError("Permanent memory must be provided in 'key: value' format.")
+            raise ValueError("Permanent memory must be provided in 'key: value' format.\n"
+                  "Try 'subject: full memory', like 'age: I am 39 years old.'\n"
+                  "Memory discarded.")
         key, value = memory_data.split(':', 1)
         key = key.strip()
         value = value.strip()

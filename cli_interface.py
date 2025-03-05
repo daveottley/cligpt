@@ -78,11 +78,11 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
            
             if user_input in ["--help", "-h"]:
                 print("REPL Help:")
-                print("  exit, quit          : Exit interactive mode")
-                print("  --remember <text>   : Permanently save the given text")
-                print("  :view-memory        : Display all permanent memories")
-                print("  :forget-memory <id>  : Remove a permanent memory by its ID")
-                print("  :export-memory <file>: Export permanent memories to a file")
+                print("  exit, quit             : Exit interactive mode")
+                print("  --remember <key:value> : Save a semantically indexed long-term memory")
+                print("  :view-memory           : Display all long-term memories")
+                print("  :forget-memory <id>    : Remove a long-term memory by its ID")
+                print("  :export-memory <file>  : Export long-term memories to a file")
                 print("  Flags: +debug, -debug, -high, -medium, -low")
                 print("  Type your query directly to send it to the AI.")
                 continue
@@ -96,8 +96,11 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
             # Handle special in-chat memory commands.
             if user_input.startswith("--remember "):
                 text = user_input[len("--remember "):].strip()
-                entry = add_permanent_memory(text)
-                print(f"Added permanent memory [{entry['id']}] at {entry['timestamp']}.")
+                try:
+                    entry = add_permanent_memory(text)
+                    print(f"Added permanent memory [{entry['id']}] at {entry['timestamp']}.")
+                except ValueError as e:
+                    print(e)
                 continue
             elif user_input.startswith(":view-memory"):
                 memories = view_permanent_memory()
@@ -226,8 +229,11 @@ def main():
     elif args.command == "query":
         single_query(args.prompt, reasoning_effort=args.reasoning, debug=args.debug)
     elif args.command == "remember":
-        entry = add_permanent_memory(args.text)
-        print(f"Added permanent memory [{entry['id']}] at {entry['timestamp']}.")
+        try:
+            entry = add_permanent_memory(args.text)
+            print(f"Added permanent memory [{entry['id']}] at {entry['timestamp']}.")
+        except ValueError as e:
+            print(e)
     elif args.command == "view-memory":
         memories = view_permanent_memory()
         if memories:
