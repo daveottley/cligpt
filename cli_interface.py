@@ -62,7 +62,7 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
     print("  :forget-memory <id>  : Remove a permanent memory by its ID")
     print("  :export-memory <file>: Export permanent memories to the specified file")
     print("You can adjust flags on the fly by prepending your input with them.")
-    print("  Recognized flags: +debug, -debug, -high, -medium, -low")
+    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l)")
     print("If only flags are provided, a confirmation message is printed.")
     
     try:
@@ -76,14 +76,14 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
             if not user_input:
                 continue
            
-            if user_input in ["--help", "-h"]:
+            if user_input in ["--help"]:
                 print("REPL Help:")
                 print("  exit, quit             : Exit interactive mode")
                 print("  --remember <key:value> : Save a semantically indexed long-term memory")
                 print("  :view-memory           : Display all long-term memories")
                 print("  :forget-memory <id>    : Remove a long-term memory by its ID")
                 print("  :export-memory <file>  : Export long-term memories to a file")
-                print("  Flags: +debug, -debug, -high, -medium, -low")
+                print("  Flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l)")
                 print("  Type your query directly to send it to the AI.")
                 continue
                 
@@ -134,7 +134,8 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
 
             # Split the input into tokens.
             tokens = user_input.split()
-            recognized_flags = {"+debug", "-debug", "-high", "-medium", "-low"}
+            recognized_flags = {"+debug", "+d", "-debug", "-d", "--high", "-high", "-h",
+                               "--medium", "-medium", "-m", "--low", "-low", "-l"}
             flag_tokens = []
             query_tokens = []
             for token in tokens:
@@ -144,19 +145,19 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
                     query_tokens.append(token)
             # Process flag tokens and update current settings.
             for flag in flag_tokens:
-                if flag == "+debug":
+                if flag in {"+debug", "+d"}:
                     current_debug_mode = True
                     print("Debug mode turned ON.")
-                elif flag == "-debug":
+                elif flag in {"-debug", "-d"}:
                     current_debug_mode = False
                     print("Debug mode turned OFF.")
-                elif flag == "-high":
+                elif flag in {"--high", "-high", "-h"}:
                     current_reasoning_effort = "high"
                     print("Reasoning effort set to high.")
-                elif flag == "-medium":
+                elif flag in {"--medium", "-medium", "-m"}:
                     current_reasoning_effort = "medium"
                     print("Reasoning effort set to medium.")
-                elif flag == "-low":
+                elif flag in {"--low", "-low", "-l"}:
                     current_reasoning_effort = "low"
                     print("Reasoning effort set to low.")
             # If only flags were provided, reprint the header with updated settings.
@@ -173,19 +174,24 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
         print("\nExiting interactive mode.")
 
 def parse_args():
+    argv = sys.argv[1:]
+    subcmds = {"query", "remember", "view-memory", "forget-memory", "export-memory"}
+    if not any(arg in subcmds for arg in argv) and any(not arg.startswith(('-', '+')) for arg in argv):
+        argv = ["query"] + argv
+
     # Define a parent parser for global flags.
     global_parser = argparse.ArgumentParser(add_help=False, prefix_chars='-+')
-    global_parser.add_argument("+debug", dest="debug", action="store_true",
+    global_parser.add_argument("+debug", "+d", dest="debug", action="store_true",
                                help="Enable debug mode")
-    global_parser.add_argument("-debug", dest="debug", action="store_false",
+    global_parser.add_argument("-debug", "-d", dest="debug", action="store_false",
                                help="Disable debug mode")
     global_parser.set_defaults(debug=False)
-    global_parser.add_argument("-high", dest="reasoning", action="store_const",
+    global_parser.add_argument("--high", dest="reasoning", action="store_const",
                                const="high", help="Set reasoning effort to high")
-    global_parser.add_argument("-medium", dest="reasoning", action="store_const",
+    global_parser.add_argument("--medium", dest="reasoning", action="store_const",
                                const="medium", help="Set reasoning effort to medium (default)",
                                default="medium")
-    global_parser.add_argument("-low", dest="reasoning", action="store_const",
+    global_parser.add_argument("--low", dest="reasoning", action="store_const",
                                const="low", help="Set reasoning effort to low")
     
     # Create the main parser.
@@ -199,6 +205,8 @@ def parse_args():
     parser_query = subparsers.add_parser("query", parents=[global_parser],
                                          help="Run a one-off query", prefix_chars='-+')
     parser_query.add_argument("prompt", type=str, help="User prompt to query the AI")
+    parser_query.add_argument("-m", "--model", dest="model", default=MODEL,
+                              help="Select model to use")
     
     parser_remember = subparsers.add_parser("remember", parents=[global_parser],
                                             help="Save text permanently", prefix_chars='-+')
@@ -215,7 +223,7 @@ def parse_args():
                                           help="Export permanent memories to a file", prefix_chars='-+')
     parser_export.add_argument("output", type=str, help="Output file path")
     
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 def main():
     ensure_required_permanent_memories()
@@ -227,7 +235,7 @@ def main():
     if not getattr(args, "command", None):
         interactive_mode(args.reasoning, args.debug)
     elif args.command == "query":
-        single_query(args.prompt, reasoning_effort=args.reasoning, debug=args.debug)
+        single_query(args.prompt, reasoning_effort=args.reasoning, debug=args.debug, model=args.model)
     elif args.command == "remember":
         try:
             entry = add_permanent_memory(args.text)

@@ -75,16 +75,18 @@ def load_system_message():
     
     return formatted_message + "\n\n" + neofetch_info
 
-def single_query(user_prompt, reasoning_effort="medium", debug=False):
+def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None):
     """
     Send a query to the AI using the specified reasoning effort.
     A header is printed at the beginning of each response:
       [<model_name> - <reasoning_effort>]
     Streaming is disabled.
     """
-    # Default reasoning_effort to "medium" if not provided.
+    # Default parameters if not provided.
     if not reasoning_effort:
         reasoning_effort = "medium"
+    if not model:
+        model = MODEL
 
     system_message = load_system_message()
     pruned_context, chat_blocks, topic_tags, oldest_block = prune_context(user_prompt)
@@ -97,7 +99,7 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False):
     total_context_tokens = system_tokens + context_tokens + user_tokens
 
     # Build header
-    header_basic = f"[{MODEL} - {reasoning_effort}]"
+    header_basic = f"[{model} - {reasoning_effort}]"
     debug_header = (f"[Context Tokens: {total_context_tokens}]\n"
                     f"  [System Message: {system_tokens}]\n"
                     f"  [Pruned Context: {context_tokens}]\n"
@@ -120,7 +122,7 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False):
     
     # Always disable streaming.
     response = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         messages=messages,
         max_completion_tokens=MAX_CONTEXT_TOKENS,
         response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
