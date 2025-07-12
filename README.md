@@ -2,7 +2,8 @@
 GPT CLI Tool Help & Usage
 -------------------------
 This tool supports both one-off queries and an interactive REPL. It accepts reasoning effort flags to
-customize processing, and a debug flag for extra output.
+customize processing, and a debug flag for extra output. If no subcommand is provided,
+arguments are treated as a query by default.
 
 When the tool starts, it prints a header in the following format:
   [mode: <model_name> - reasoning effort: <reasoning_effort>]
@@ -10,11 +11,11 @@ When the tool starts, it prints a header in the following format:
 If the +debug flag is enabled, additional header information and reasoning tokens are printed.
 
 Flags:
-  -high       Set reasoning effort to high
-  -medium     Set reasoning effort to medium (default)
-  -low        Set reasoning effort to low
-  +debug      Enable debug mode (prints full header & reasoning tokens)
-  -debug      Disable debug mode
+  --high (-h)       Set reasoning effort to high
+  --medium (-m)     Set reasoning effort to medium (default)
+  --low (-l)        Set reasoning effort to low
+  +debug (+d)       Enable debug mode (prints full header & reasoning tokens)
+  -debug (-d)       Disable debug mode
 
 Please refer to this file for setup and usage instructions.
 
@@ -47,7 +48,8 @@ easier.
 ## Usage
 
 Usage Examples:
-  • gpt_cli.py query -high "inquiry text"
-  • gpt_cli.py -low
+  • gpt_cli.py --high "inquiry text"
+  • gpt_cli.py --low
   • gpt_cli.py +debug
-  • gpt_cli.py +debug -medium
+  • gpt_cli.py +debug --medium
+  • gpt_cli.py --model gpt-4 "use a specific model"
