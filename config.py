@@ -3,8 +3,8 @@
 import os
 
 # AI configuration
-MODEL = "o3-mini"
-FAST_MODEL = "gpt-3.5-turbo"
+MODEL = "o3"
+FAST_MODEL = "gpt-4o-realtime-preview"
 STREAM = True
 N = 1
 PRESENCE_PENALTY = 0
