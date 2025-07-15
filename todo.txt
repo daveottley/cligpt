@@ -4,3 +4,22 @@ gpt repeat [ N ]          # Repeat the Nth last unique response
 gpt repeat 'context'      # Repeat the last response about 'context' or complain about no context
 gpt grep 'topic'          # Repeat all replys that are relevent to 'topic' (fuzzy?, AI?)
 # Add response IDs        # UID to use for future reference
+Allow syntax like this: cat code.c | gpt 'Help me evaluate this C code:'
+  - Allow unlimited arguments after query (or implied query) command
+  - Merge all arguments after query into the single query string
+  - If input is not terminal, pipe from std as per the ChatGPT log
+Move cligpt to a top-level repo
+Delete all old repos
+add dotfiles repo
+add .zshrc (etc) there
+  - Consider consolidating my .zshrc to clean up home folder? (consult chatgpt)
+add all .zsh files there
+add .gitconfig there
+add nvim config there
+add hyprland config there (3 monitors)
+add ghostty config
+add cachy-os post install script
+Add detailed README and instructions
+  - show examples of ways to use cligpt
+Rewrite cligpt in C
+Create a kind of trivia game using cligpt
