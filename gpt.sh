@@ -7,16 +7,16 @@ function gpt() {
     set -f  # Disable globbing
     
     # Change directory to the project's location (adjust path as needed)
-    cd ~/scripts/Learning-Python/cligpt || {
-      echo "Failed to navigate to ~/scripts/Learning-Python/cligpt"
+    cd $GPT_HOME || {
+      echo "Failed to navigate to $GPT_HOME"
       return 1
     }
 
     # Activate the virtual environment
-    source ~/scripts/Learning-Python/cligpt/.venv/bin/activate
+    source $GPT_HOME/.venv/bin/activate
     
     # Execute the Python CLI tool with any passed arguments
-    python3 ~/scripts/Learning-Python/cligpt/cligpt.py "$@"
+    python3 $GPT_HOME/cligpt.py "$@"
     
     # Deactivate the virtual environment
     deactivate
