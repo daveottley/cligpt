@@ -28,3 +28,8 @@
 
 # Implement terminal skills test
   - gpt test {shell,c,javascript,linux,etc.}
+
+# Add background processing for non-realtime queries
+  - Considering  using a switch such as -b
+  - Add a switch to check jobs and print output from jobs
+  - Try to mimic a 'tab' system where the user can split their train of though
