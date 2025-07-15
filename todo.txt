@@ -19,6 +19,7 @@ add nvim config there
 add hyprland config there (3 monitors)
 add ghostty config
 add cachy-os post install script
+Add symlinks in home
 Add detailed README and instructions
   - show examples of ways to use cligpt
 Rewrite cligpt in C
