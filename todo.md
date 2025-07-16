@@ -33,3 +33,5 @@
   - Considering  using a switch such as -b
   - Add a switch to check jobs and print output from jobs
   - Try to mimic a 'tab' system where the user can split their train of though
+
+# Add cloud save feature
