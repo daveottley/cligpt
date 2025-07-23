@@ -1,3 +1,4 @@
+- [ ] Add gpt -i - functionality (read from stdin)
 - [ ] Add something to do during LONG wait times (2-5 mins experienced)
 - [ ] Add the following commands:
     - [ ] gpt tail -n X             # Tail the context.txt log
