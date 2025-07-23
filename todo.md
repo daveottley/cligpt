@@ -1,3 +1,4 @@
+- [ ] Add something to do during LONG wait times (2-5 mins experienced)
 - [ ] Add the following commands:
     - [ ] gpt tail -n X             # Tail the context.txt log
     - [ ] gpt repeat [ N ]          # Repeat the Nth last unique response
@@ -61,4 +62,3 @@
     - [ ] Considering  using a switch such as -b
     - [ ] Add a switch to check jobs and print output from jobs
     - [ ] Try to mimic a 'tab' system where the user can split their train of though
->>>>>>> 827e4b9 (Update and expand todo.md)
