@@ -9,3 +9,4 @@ def do_search(query: str, k: int = 5):
         hits = [r["body"] for r in ddgs.text(query, max_results=k)]
     return "\n".join(hits)
 
+functions
