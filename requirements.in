@@ -1,7 +1,13 @@
 openai
+<<<<<<< HEAD
 click
 duckduckgo_search
 httpx
 pydantic
 tqdm
+=======
+duckduckgo_search
+click
+pydantic
+>>>>>>> 341a938 (Remove requirements.txt.old. Dont need.)
 lxml
