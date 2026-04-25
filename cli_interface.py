@@ -45,16 +45,44 @@ def process_command_substitutions(query):
     # Replace every occurrence of $(...) in the query.
     return re.sub(pattern, replacer, query, flags=re.DOTALL)
 
-def interactive_mode(initial_reasoning_effort, initial_debug_mode):
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+def has_default_query_prompt(argv):
+    options_with_values = {"--width", "--model", "-m"}
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in options_with_values:
+            index += 2
+            continue
+        if arg.startswith(("-", "+")):
+            index += 1
+            continue
+        return True
+    return False
+
+def format_mode_header(reasoning_effort, debug_mode, width):
+    width_label = width if width else "auto"
+    header = f"[mode: {MODEL} - reasoning effort: {reasoning_effort} - width: {width_label}]"
+    if debug_mode:
+        header += " (Debug mode enabled)"
+    return header
+
+def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width=None):
     # Set initial flag values (default reasoning effort defaults to "medium")
     current_reasoning_effort = initial_reasoning_effort or "medium"
     current_debug_mode = initial_debug_mode
+    current_width = initial_width
 
     # Print initial REPL header.
-    header = f"[mode: {MODEL} - reasoning effort: {current_reasoning_effort}]"
-    if current_debug_mode:
-        header += " (Debug mode enabled)"
-    print(header)
+    print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width))
     print("Entering interactive mode. Type 'exit' or 'quit' to leave.")
     print("You may use special commands in chat:")
     print("  --remember <text>    : Permanently save the given text")
@@ -62,7 +90,7 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
     print("  :forget-memory <id>  : Remove a permanent memory by its ID")
     print("  :export-memory <file>: Export permanent memories to the specified file")
     print("You can adjust flags on the fly by prepending your input with them.")
-    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l)")
+    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --width <num>")
     print("If only flags are provided, a confirmation message is printed.")
     
     try:
@@ -83,7 +111,7 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
                 print("  :view-memory           : Display all long-term memories")
                 print("  :forget-memory <id>    : Remove a long-term memory by its ID")
                 print("  :export-memory <file>  : Export long-term memories to a file")
-                print("  Flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l)")
+                print("  Flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --width <num>")
                 print("  Type your query directly to send it to the AI.")
                 continue
                 
@@ -138,13 +166,35 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
                                "--medium", "-medium", "-m", "--low", "-low", "-l"}
             flag_tokens = []
             query_tokens = []
-            for token in tokens:
+            index = 0
+            malformed_flag = False
+            while index < len(tokens):
+                token = tokens[index]
+                if token == "--width":
+                    if index + 1 >= len(tokens):
+                        print("Usage: --width <num>")
+                        malformed_flag = True
+                        break
+                    try:
+                        width_value = int(tokens[index + 1])
+                        if width_value < 1:
+                            raise ValueError
+                    except ValueError:
+                        print("Width must be a positive integer.")
+                        malformed_flag = True
+                        break
+                    flag_tokens.append(("--width", width_value))
+                    index += 2
+                    continue
                 if token in recognized_flags:
-                    flag_tokens.append(token)
+                    flag_tokens.append((token, None))
                 else:
                     query_tokens.append(token)
+                index += 1
+            if malformed_flag:
+                continue
             # Process flag tokens and update current settings.
-            for flag in flag_tokens:
+            for flag, value in flag_tokens:
                 if flag in {"+debug", "+d"}:
                     current_debug_mode = True
                     print("Debug mode turned ON.")
@@ -160,43 +210,55 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode):
                 elif flag in {"--low", "-low", "-l"}:
                     current_reasoning_effort = "low"
                     print("Reasoning effort set to low.")
+                elif flag == "--width":
+                    current_width = value
+                    print(f"Response width set to {current_width}.")
             # If only flags were provided, reprint the header with updated settings.
             if not query_tokens:
-                new_header = f"[mode: {MODEL} - reasoning effort: {current_reasoning_effort}]"
-                if current_debug_mode:
-                    new_header += " (Debug mode enabled)"
-                print(new_header)
+                print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width))
             else:
                 # Otherwise, join query tokens into a query string and process it.
                 query = " ".join(query_tokens)
-                single_query(query, reasoning_effort=current_reasoning_effort, debug=current_debug_mode)
+                single_query(
+                    query,
+                    reasoning_effort=current_reasoning_effort,
+                    debug=current_debug_mode,
+                    width=current_width,
+                )
     except (KeyboardInterrupt, EOFError):
         print("\nExiting interactive mode.")
 
 def parse_args():
     argv = sys.argv[1:]
     subcmds = {"query", "remember", "view-memory", "forget-memory", "export-memory"}
-    if not any(arg in subcmds for arg in argv) and any(not arg.startswith(('-', '+')) for arg in argv):
+    if not any(arg in subcmds for arg in argv) and has_default_query_prompt(argv):
         argv = ["query"] + argv
 
     # Define a parent parser for global flags.
     global_parser = argparse.ArgumentParser(add_help=False, prefix_chars='-+')
     global_parser.add_argument("+debug", "+d", dest="debug", action="store_true",
+                               default=argparse.SUPPRESS,
                                help="Enable debug mode")
     global_parser.add_argument("-debug", "-d", dest="debug", action="store_false",
+                               default=argparse.SUPPRESS,
                                help="Disable debug mode")
-    global_parser.set_defaults(debug=False)
     global_parser.add_argument("--high", dest="reasoning", action="store_const",
-                               const="high", help="Set reasoning effort to high")
+                               const="high", default=argparse.SUPPRESS,
+                               help="Set reasoning effort to high")
     global_parser.add_argument("--medium", dest="reasoning", action="store_const",
                                const="medium", help="Set reasoning effort to medium (default)",
-                               default="medium")
+                               default=argparse.SUPPRESS)
     global_parser.add_argument("--low", dest="reasoning", action="store_const",
-                               const="low", help="Set reasoning effort to low")
+                               const="low", default=argparse.SUPPRESS,
+                               help="Set reasoning effort to low")
+    global_parser.add_argument("--width", dest="width", type=positive_int,
+                               default=argparse.SUPPRESS,
+                               help="Format responses to this maximum line width")
     
     # Create the main parser.
     parser = argparse.ArgumentParser(
         description="CLI GPT Help Agent with context and permanent memory management",
+        parents=[global_parser],
         prefix_chars='-+'
     )
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
@@ -232,10 +294,18 @@ def main():
         args.reasoning = "medium"
     if not hasattr(args, "debug"):
         args.debug = False
+    if not hasattr(args, "width"):
+        args.width = None
     if not getattr(args, "command", None):
-        interactive_mode(args.reasoning, args.debug)
+        interactive_mode(args.reasoning, args.debug, args.width)
     elif args.command == "query":
-        single_query(args.prompt, reasoning_effort=args.reasoning, debug=args.debug, model=args.model)
+        single_query(
+            args.prompt,
+            reasoning_effort=args.reasoning,
+            debug=args.debug,
+            model=args.model,
+            width=args.width,
+        )
     elif args.command == "remember":
         try:
             entry = add_permanent_memory(args.text)
@@ -258,4 +328,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

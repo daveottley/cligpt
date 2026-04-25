@@ -59,6 +59,7 @@ You invoke the helper by typing
   • python3 cligpt.py --model o3 --high "What is the meaning of life?"
   • python3 cligpt.py --low "Why is the sky blue?"
   • python3 cligpt.py +debug "Why aren't you returning an answer?"
+  • python3 cligpt.py --width 100 "Explain UNIX pipes"
 
 ### Model
 
@@ -80,6 +81,12 @@ You can tell the program how much debug information you want to see.
   +debug (+d)       Enable debug mode (prints full header & reasoning tokens)
   -debug (-d)       Disable debug mode
 
+### Response Width
+
+By default, responses are formatted to the current terminal width minus one
+column. You can override this with:
+  --width 100       Format response lines to at most 100 columns
+
 
 ## Output
 
@@ -89,4 +96,3 @@ When the tool starts, it prints a header in the following format:
 If the +debug flag is enabled, additional header information and reasoning tokens are printed.
 
 Your response is printed below the debug information and should fit in one terminal window.
-

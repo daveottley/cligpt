@@ -3,24 +3,120 @@
 import sys
 import os
 import platform
-import datetime
-import re
+import json
+import shutil
 from openai import OpenAI
-from config import MAX_CONTEXT_TOKENS, MODEL, FAST_MODEL, PRESENCE_PENALTY, SYSTEM_MESSAGE_FILE
+from config import MAX_CONTEXT_TOKENS, MODEL, FAST_MODEL, SYSTEM_MESSAGE_FILE
 from memory_manager import (
         get_neofetch_output,
         prune_context,
         add_to_context,
-        estimate_tokens
 )
-import time
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+TOPIC_TAG_SCHEMA = {
+    "type": "json_schema",
+    "name": "topic_tags",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "topics": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Up to 5 concise topic tags, broad to specific."
+            }
+        },
+        "required": ["topics"],
+        "additionalProperties": False
+    }
+}
+
 def supports_reasoning_effort(model):
     """Return whether the model family accepts the reasoning_effort parameter."""
     return model.startswith(("gpt-5", "o1", "o3", "o4"))
+
+def resolve_output_width(width=None):
+    if width:
+        return max(1, width), "flag"
+    return max(1, shutil.get_terminal_size((80, 20)).columns - 1), "terminal"
+
+def get_nested_attr(obj, *names, default=None):
+    current = obj
+    for name in names:
+        if current is None:
+            return default
+        if isinstance(current, dict):
+            current = current.get(name)
+        else:
+            current = getattr(current, name, None)
+    return current if current is not None else default
+
+def extract_response_text(response):
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return output_text
+
+    chunks = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            text = getattr(content, "text", None)
+            if text:
+                chunks.append(text)
+    return "".join(chunks)
+
+class StreamingLineWrapper:
+    def __init__(self, width):
+        self.width = max(1, width)
+        self.line = ""
+        self.word = ""
+
+    def feed(self, text):
+        output = []
+        for char in text:
+            if char == "\n":
+                self._flush_word(output)
+                output.append(self.line.rstrip() + "\n" if self.line else "\n")
+                self.line = ""
+            elif char.isspace():
+                self._flush_word(output)
+            else:
+                self.word += char
+        return "".join(output)
+
+    def finish(self):
+        output = []
+        self._flush_word(output)
+        if self.line:
+            output.append(self.line.rstrip())
+            self.line = ""
+        return "".join(output)
+
+    def _flush_word(self, output):
+        if not self.word:
+            return
+
+        word = self.word
+        self.word = ""
+
+        while len(word) > self.width:
+            if self.line:
+                output.append(self.line.rstrip() + "\n")
+                self.line = ""
+            output.append(word[:self.width] + "\n")
+            word = word[self.width:]
+
+        if not word:
+            return
+        if not self.line:
+            self.line = word
+        elif len(self.line) + 1 + len(word) <= self.width:
+            self.line += " " + word
+        else:
+            output.append(self.line.rstrip() + "\n")
+            self.line = word
 
 def load_system_message():
     """Load and format the system message from SYSTEM_MESSAGE_FILE."""
@@ -55,7 +151,40 @@ def load_system_message():
     
     return formatted_message + "\n\n" + neofetch_info
 
-def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None):
+def extract_topic_tags(user_prompt, answer_text, model=FAST_MODEL):
+    response = client.responses.create(
+        model=model,
+        instructions=(
+            "Extract up to 5 concise topic tags from the user's prompt and "
+            "assistant answer. Use broad-to-specific tags. Return only the "
+            "structured data requested."
+        ),
+        input=[
+            {
+                "role": "user",
+                "content": (
+                    f"User prompt:\n{user_prompt}\n\n"
+                    f"Assistant answer:\n{answer_text}"
+                ),
+            }
+        ],
+        max_output_tokens=120,
+        text={"format": TOPIC_TAG_SCHEMA},
+        store=False,
+    )
+
+    raw_content = extract_response_text(response)
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError:
+        return []
+
+    topics = parsed.get("topics", [])
+    if not isinstance(topics, list):
+        return []
+    return [str(topic).strip() for topic in topics if str(topic).strip()][:5]
+
+def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None, width=None):
     """
     Send a query to the AI using the specified reasoning effort.
     A header is printed at the beginning of each response:
@@ -67,6 +196,7 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
         reasoning_effort = "medium"
     if not model:
         model = MODEL
+    output_width, width_source = resolve_output_width(width)
 
     system_message = load_system_message()
     pruned_context, chat_blocks, topic_tags, oldest_block = prune_context(user_prompt)
@@ -79,14 +209,15 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
     total_context_tokens = system_tokens + context_tokens + user_tokens
 
     # Build header
-    header_basic = f"[{model} - {reasoning_effort}]"
+    header_basic = f"[{model} - {reasoning_effort} - width: {output_width} ({width_source})]"
     debug_header = (f"[Context Tokens: {total_context_tokens}]\n"
                     f"  [System Message: {system_tokens}]\n"
                     f"  [Pruned Context: {context_tokens}]\n"
                     f"    [Chat Blocks: {chat_blocks}]\n"
                     f"    [Topic Tags: {topic_tags}]\n"
                     f"    [Oldest Block: {oldest_block}]\n"
-                    f"  [User Prompt: {user_tokens}]\n")
+                    f"  [User Prompt: {user_tokens}]\n"
+                    f"  [Output Width: {output_width} ({width_source})]\n")
     
     if debug:
         sys.stdout.write(header_basic + "\n" + debug_header)
@@ -94,29 +225,36 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
         sys.stdout.write(header_basic + "\n")
     sys.stdout.flush()
         
-    combined_system = system_message + "\n\n" + pruned_context
-    messages = [
-        {"role": "system", "content": combined_system},
-        {"role": "user", "content": user_prompt}
-    ]
+    combined_system = (
+        system_message
+        + "\n\n"
+        + pruned_context
+        + "\n\n"
+        + (
+            f"Format the visible answer for a terminal with a hard maximum "
+            f"line length of {output_width} characters. Prefer lines as close "
+            f"to {output_width} characters as natural wording allows. Do not "
+            f"use lines longer than {output_width} characters."
+        )
+    )
     
     request_args = {
         "model": model,
-        "messages": messages,
-        "max_completion_tokens": MAX_CONTEXT_TOKENS,
-        "n": 1,
-        "presence_penalty": PRESENCE_PENALTY,
+        "instructions": combined_system,
+        "input": [{"role": "user", "content": user_prompt}],
+        "max_output_tokens": MAX_CONTEXT_TOKENS,
         "stream": True,
-        "stream_options": {"include_usage": True},
+        "text": {"format": {"type": "text"}},
         "store": True
     }
     if supports_reasoning_effort(model):
-        request_args["reasoning_effort"] = reasoning_effort
+        request_args["reasoning"] = {"effort": reasoning_effort}
 
-    stream = client.chat.completions.create(**request_args)
+    stream = client.responses.create(**request_args)
 
-    answer_chunks = []
+    visible_chunks = []
     reasoning_tokens_used = 0
+    wrapper = StreamingLineWrapper(output_width)
 
     if debug:
         sys.stdout.write("[streaming response]\n\n")
@@ -124,23 +262,44 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
         sys.stdout.write("\n")
     sys.stdout.flush()
 
-    for chunk in stream:
-        if getattr(chunk, "usage", None):
-            completion_details = getattr(chunk.usage, "completion_tokens_details", None)
-            reasoning_tokens_used = getattr(completion_details, "reasoning_tokens", 0) or 0
-            continue
+    for event in stream:
+        event_type = getattr(event, "type", "")
+        if event_type == "response.output_text.delta":
+            content = getattr(event, "delta", "")
+            visible_text = wrapper.feed(content)
+            if visible_text:
+                visible_chunks.append(visible_text)
+                sys.stdout.write(visible_text)
+                sys.stdout.flush()
+        elif event_type == "response.refusal.delta":
+            content = getattr(event, "delta", "")
+            visible_text = wrapper.feed(content)
+            if visible_text:
+                visible_chunks.append(visible_text)
+                sys.stdout.write(visible_text)
+                sys.stdout.flush()
+        elif event_type == "response.completed":
+            reasoning_tokens_used = (
+                get_nested_attr(
+                    event,
+                    "response",
+                    "usage",
+                    "output_tokens_details",
+                    "reasoning_tokens",
+                    default=0,
+                )
+                or 0
+            )
+        elif event_type in {"response.failed", "error", "response.error"}:
+            error = get_nested_attr(event, "response", "error") or getattr(event, "error", None)
+            raise RuntimeError(f"OpenAI response stream failed: {error}")
 
-        if not chunk.choices:
-            continue
+    final_text = wrapper.finish()
+    if final_text:
+        visible_chunks.append(final_text)
+        sys.stdout.write(final_text)
 
-        delta = chunk.choices[0].delta
-        content = getattr(delta, "content", None)
-        if content:
-            answer_chunks.append(content)
-            sys.stdout.write(content)
-            sys.stdout.flush()
-
-    answer_text = "".join(answer_chunks)
+    answer_text = "".join(visible_chunks)
 
     if debug:
         sys.stdout.write(f"\n\n[Reasoning Tokens: {reasoning_tokens_used}]\n")
@@ -148,5 +307,11 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
         sys.stdout.write("\n")
     sys.stdout.flush()
     
-    add_to_context(user_prompt, answer_text, [], reasoning_effort)
+    try:
+        topics = extract_topic_tags(user_prompt, answer_text)
+    except Exception as exc:
+        if debug:
+            sys.stderr.write(f"[Topic tag extraction failed: {exc}]\n")
+        topics = []
+    add_to_context(user_prompt, answer_text, topics, reasoning_effort)
     return answer_text

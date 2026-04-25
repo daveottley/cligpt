@@ -7,11 +7,10 @@ Assume conversation continuity unless no context is provided.
 
 ## Output Formatting
 
-- All output lines should **always** be kept under 80 characters.
+- Follow the runtime line-width instruction provided with each request.
 - Use friendly, educative, and concise language.
 
 # User Settings
 The user is on {distribution} {operating_system} version {version} and uses {shell} as a shell and {editor} as an editor.
 
 # Pruned Context History
-

@@ -15,8 +15,21 @@ function gpt() {
     # Activate the virtual environment
     source $GPT_HOME/.venv/bin/activate
     
-    # Execute the Python CLI tool with any passed arguments
-    python3 $GPT_HOME/cligpt.py "$@"
+    local has_width=0
+    for arg in "$@"; do
+      if [[ "$arg" == "--width" ]]; then
+        has_width=1
+        break
+      fi
+    done
+
+    if [[ $has_width -eq 0 ]]; then
+      local terminal_columns="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
+      local terminal_width=$(( terminal_columns > 1 ? terminal_columns - 1 : 1 ))
+      python3 $GPT_HOME/cligpt.py --width "$terminal_width" "$@"
+    else
+      python3 $GPT_HOME/cligpt.py "$@"
+    fi
     
     # Deactivate the virtual environment
     deactivate
@@ -25,4 +38,3 @@ function gpt() {
     set +f 
   )
 }
-
