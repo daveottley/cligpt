@@ -3,7 +3,7 @@
 import os
 
 # AI configuration
-MODEL = "gpt-5.4"
+MODEL = "gpt-5.5"
 FAST_MODEL = "gpt-4o"
 STREAM = True
 N = 1
