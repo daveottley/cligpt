@@ -15,6 +15,10 @@ This tool supports both one-off queries and an interactive REPL. It accepts reas
 customize processing, and a debug flag for extra output. If no subcommand is provided,
 arguments are treated as a query by default.
 
+Web search is enabled by default through OpenAI's hosted web search tool. This lets
+cligpt answer questions about current, fast-changing, or source-sensitive topics
+without maintaining a local scraper dependency.
+
 **CAUTION:** This program may consume high rates of REAL-WORLD-MONEY depending on token
 usage!
 
@@ -60,6 +64,7 @@ You invoke the helper by typing
   • python3 cligpt.py --low "Why is the sky blue?"
   • python3 cligpt.py +debug "Why aren't you returning an answer?"
   • python3 cligpt.py --width 100 "Explain UNIX pipes"
+  • python3 cligpt.py --no-web "Explain POSIX pipes from model knowledge only"
 
 ### Model
 
@@ -87,11 +92,34 @@ By default, responses are formatted to the current terminal width minus one
 column. You can override this with:
   --width 100       Format response lines to at most 100 columns
 
+### Web Search
+
+Web search is enabled by default. The model can decide when to search and should
+use search for current, fast-changing, or source-sensitive facts. If search is
+used, cligpt asks the model to make source URLs visible in the answer and prints
+only final-answer citations after the streamed response.
+
+OpenAI may also return broader web-search source metadata that was not cited in
+the final answer. cligpt logs those uncited sources to `context.txt` and prints
+an italic note with that file path instead of mixing them into the visible
+source list.
+
+Disable web search for a request with:
+  --no-web          Use model knowledge and local context only
+
+Examples:
+  • python3 cligpt.py "What changed in Python 3.14?"
+  • python3 cligpt.py --no-web "Explain how a pipe works in Unix"
+
+In interactive mode, web search starts enabled. Prefix a message with `--no-web`
+to disable it for that message and following messages. Prefix a later message
+with `--web` to turn it back on.
+
 
 ## Output
 
 When the tool starts, it prints a header in the following format:
-  [mode: <model_name> - reasoning effort: <reasoning_effort>]
+  [mode: <model_name> - reasoning effort: <reasoning_effort> - web: <on|off> - width: <width>]
 
 If the +debug flag is enabled, additional header information and reasoning tokens are printed.
 

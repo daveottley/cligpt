@@ -5,12 +5,15 @@ import os
 import platform
 import json
 import shutil
+import datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from openai import OpenAI
-from config import MAX_CONTEXT_TOKENS, MODEL, FAST_MODEL, SYSTEM_MESSAGE_FILE
+from config import MAX_CONTEXT_TOKENS, MODEL, FAST_MODEL, SYSTEM_MESSAGE_FILE, CONTEXT_FILE
 from memory_manager import (
         get_neofetch_output,
         prune_context,
         add_to_context,
+        save_context_block,
 )
 
 # Initialize OpenAI client
@@ -66,6 +69,94 @@ def extract_response_text(response):
             if text:
                 chunks.append(text)
     return "".join(chunks)
+
+def source_to_text(source):
+    if isinstance(source, dict):
+        return json.dumps(source, ensure_ascii=False, sort_keys=True)
+    if hasattr(source, "model_dump"):
+        return json.dumps(source.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+    if hasattr(source, "__dict__"):
+        return json.dumps(vars(source), ensure_ascii=False, sort_keys=True, default=str)
+    return str(source)
+
+def response_output_items(response):
+    return get_nested_attr(response, "output", default=[]) or []
+
+def content_items(item):
+    return get_nested_attr(item, "content", default=[]) or []
+
+def annotation_items(content):
+    return get_nested_attr(content, "annotations", default=[]) or []
+
+def comparable_url(url):
+    if not url:
+        return url
+    parts = urlsplit(url)
+    filtered_query = urlencode(
+        [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_")
+        ],
+        doseq=True,
+    )
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, filtered_query, ""))
+
+def collect_final_answer_citations(response):
+    citations = []
+    seen_urls = set()
+
+    for item in response_output_items(response):
+        for content in content_items(item):
+            for annotation in annotation_items(content):
+                url = get_nested_attr(annotation, "url")
+                comparable = comparable_url(url)
+                if not url or comparable in seen_urls:
+                    continue
+                title = get_nested_attr(annotation, "title", default=url)
+                citations.append({"title": title, "url": url, "text": source_to_text(annotation)})
+                seen_urls.add(comparable)
+
+    return citations
+
+def collect_uncited_web_sources(response, cited_urls):
+    sources = []
+    seen_urls = {comparable_url(url) for url in cited_urls}
+
+    for item in response_output_items(response):
+        action_sources = get_nested_attr(item, "action", "sources", default=[]) or []
+        for source in action_sources:
+            url = get_nested_attr(source, "url")
+            comparable = comparable_url(url)
+            if not url or comparable in seen_urls:
+                continue
+            title = get_nested_attr(source, "title", default=url)
+            sources.append({"title": title, "url": url, "text": source_to_text(source)})
+            seen_urls.add(comparable)
+
+    return sources
+
+def log_uncited_web_sources(user_prompt, sources):
+    if not sources:
+        return None
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        f"[{timestamp}]",
+        "Uncited web-search sources returned by the OpenAI web search tool.",
+        "These sources were not final-answer citations.",
+        f">>> {user_prompt}",
+    ]
+    for index, source in enumerate(sources, start=1):
+        lines.extend([
+            f"[{index}]",
+            f"Title: {source['title']}",
+            f"URL: {source['url']}",
+            f"Complete source text: {source['text']}",
+        ])
+    save_context_block("\n".join(lines))
+    return os.path.abspath(CONTEXT_FILE)
 
 class StreamingLineWrapper:
     def __init__(self, width):
@@ -184,7 +275,14 @@ def extract_topic_tags(user_prompt, answer_text, model=FAST_MODEL):
         return []
     return [str(topic).strip() for topic in topics if str(topic).strip()][:5]
 
-def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None, width=None):
+def single_query(
+    user_prompt,
+    reasoning_effort="medium",
+    debug=False,
+    model=None,
+    width=None,
+    web_search=True,
+):
     """
     Send a query to the AI using the specified reasoning effort.
     A header is printed at the beginning of each response:
@@ -209,7 +307,8 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
     total_context_tokens = system_tokens + context_tokens + user_tokens
 
     # Build header
-    header_basic = f"[{model} - {reasoning_effort} - width: {output_width} ({width_source})]"
+    web_label = "web:on" if web_search else "web:off"
+    header_basic = f"[{model} - {reasoning_effort} - {web_label} - width: {output_width} ({width_source})]"
     debug_header = (f"[Context Tokens: {total_context_tokens}]\n"
                     f"  [System Message: {system_tokens}]\n"
                     f"  [Pruned Context: {context_tokens}]\n"
@@ -217,6 +316,7 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
                     f"    [Topic Tags: {topic_tags}]\n"
                     f"    [Oldest Block: {oldest_block}]\n"
                     f"  [User Prompt: {user_tokens}]\n"
+                    f"  [Web Search: {'enabled' if web_search else 'disabled'}]\n"
                     f"  [Output Width: {output_width} ({width_source})]\n")
     
     if debug:
@@ -235,6 +335,10 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
             f"line length of {output_width} characters. Prefer lines as close "
             f"to {output_width} characters as natural wording allows. Do not "
             f"use lines longer than {output_width} characters."
+            f"\n\nWeb search is {'enabled' if web_search else 'disabled'} for "
+            f"this request. When web search is enabled, use it for current, "
+            f"fast-changing, or source-sensitive facts. If web search is used, "
+            f"make source URLs visible in the answer."
         )
     )
     
@@ -247,6 +351,10 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
         "text": {"format": {"type": "text"}},
         "store": True
     }
+    if web_search:
+        request_args["tools"] = [{"type": "web_search"}]
+        request_args["tool_choice"] = "auto"
+        request_args["include"] = ["web_search_call.action.sources"]
     if supports_reasoning_effort(model):
         request_args["reasoning"] = {"effort": reasoning_effort}
 
@@ -254,6 +362,7 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
 
     visible_chunks = []
     reasoning_tokens_used = 0
+    completed_response = None
     wrapper = StreamingLineWrapper(output_width)
 
     if debug:
@@ -279,6 +388,7 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
                 sys.stdout.write(visible_text)
                 sys.stdout.flush()
         elif event_type == "response.completed":
+            completed_response = getattr(event, "response", None)
             reasoning_tokens_used = (
                 get_nested_attr(
                     event,
@@ -300,6 +410,26 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
         sys.stdout.write(final_text)
 
     answer_text = "".join(visible_chunks)
+
+    final_citations = collect_final_answer_citations(completed_response) if completed_response else []
+    if final_citations:
+        sys.stdout.write("\n\nSources:\n")
+        for index, citation in enumerate(final_citations, start=1):
+            sys.stdout.write(f"[{index}] {citation['title']}: {citation['url']}\n")
+
+    cited_urls = {citation["url"] for citation in final_citations}
+    uncited_sources = (
+        collect_uncited_web_sources(completed_response, cited_urls)
+        if completed_response else []
+    )
+    uncited_context_path = log_uncited_web_sources(user_prompt, uncited_sources)
+    if uncited_context_path:
+        note = (
+            "\n*Additional web-search sources were returned but not cited in "
+            f"the final answer; they were logged to {uncited_context_path}.*"
+        )
+        sys.stdout.write(note + "\n")
+        answer_text += note
 
     if debug:
         sys.stdout.write(f"\n\n[Reasoning Tokens: {reasoning_tokens_used}]\n")

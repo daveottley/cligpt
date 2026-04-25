@@ -68,21 +68,26 @@ def has_default_query_prompt(argv):
         return True
     return False
 
-def format_mode_header(reasoning_effort, debug_mode, width):
+def format_mode_header(reasoning_effort, debug_mode, width, web_search=True):
     width_label = width if width else "auto"
-    header = f"[mode: {MODEL} - reasoning effort: {reasoning_effort} - width: {width_label}]"
+    web_label = "on" if web_search else "off"
+    header = (
+        f"[mode: {MODEL} - reasoning effort: {reasoning_effort} - "
+        f"web: {web_label} - width: {width_label}]"
+    )
     if debug_mode:
         header += " (Debug mode enabled)"
     return header
 
-def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width=None):
+def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width=None, initial_web_search=True):
     # Set initial flag values (default reasoning effort defaults to "medium")
     current_reasoning_effort = initial_reasoning_effort or "medium"
     current_debug_mode = initial_debug_mode
     current_width = initial_width
+    current_web_search = initial_web_search
 
     # Print initial REPL header.
-    print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width))
+    print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width, current_web_search))
     print("Entering interactive mode. Type 'exit' or 'quit' to leave.")
     print("You may use special commands in chat:")
     print("  --remember <text>    : Permanently save the given text")
@@ -90,7 +95,7 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width
     print("  :forget-memory <id>  : Remove a permanent memory by its ID")
     print("  :export-memory <file>: Export permanent memories to the specified file")
     print("You can adjust flags on the fly by prepending your input with them.")
-    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --width <num>")
+    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --width <num>")
     print("If only flags are provided, a confirmation message is printed.")
     
     try:
@@ -111,7 +116,8 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width
                 print("  :view-memory           : Display all long-term memories")
                 print("  :forget-memory <id>    : Remove a long-term memory by its ID")
                 print("  :export-memory <file>  : Export long-term memories to a file")
-                print("  Flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --width <num>")
+                print("  Flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --width <num>")
+                print("  Web search is enabled by default. Use --no-web for offline/model-only answers.")
                 print("  Type your query directly to send it to the AI.")
                 continue
                 
@@ -163,7 +169,8 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width
             # Split the input into tokens.
             tokens = user_input.split()
             recognized_flags = {"+debug", "+d", "-debug", "-d", "--high", "-high", "-h",
-                               "--medium", "-medium", "-m", "--low", "-low", "-l"}
+                               "--medium", "-medium", "-m", "--low", "-low", "-l",
+                               "--web", "--no-web"}
             flag_tokens = []
             query_tokens = []
             index = 0
@@ -210,12 +217,18 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width
                 elif flag in {"--low", "-low", "-l"}:
                     current_reasoning_effort = "low"
                     print("Reasoning effort set to low.")
+                elif flag == "--web":
+                    current_web_search = True
+                    print("Web search turned ON.")
+                elif flag == "--no-web":
+                    current_web_search = False
+                    print("Web search turned OFF.")
                 elif flag == "--width":
                     current_width = value
                     print(f"Response width set to {current_width}.")
             # If only flags were provided, reprint the header with updated settings.
             if not query_tokens:
-                print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width))
+                print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width, current_web_search))
             else:
                 # Otherwise, join query tokens into a query string and process it.
                 query = " ".join(query_tokens)
@@ -224,6 +237,7 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width
                     reasoning_effort=current_reasoning_effort,
                     debug=current_debug_mode,
                     width=current_width,
+                    web_search=current_web_search,
                 )
     except (KeyboardInterrupt, EOFError):
         print("\nExiting interactive mode.")
@@ -254,10 +268,16 @@ def parse_args():
     global_parser.add_argument("--width", dest="width", type=positive_int,
                                default=argparse.SUPPRESS,
                                help="Format responses to this maximum line width")
+    global_parser.add_argument("--no-web", dest="web_search", action="store_false",
+                               default=argparse.SUPPRESS,
+                               help="Disable default web search for this request")
     
     # Create the main parser.
     parser = argparse.ArgumentParser(
-        description="CLI GPT Help Agent with context and permanent memory management",
+        description=(
+            "CLI GPT Help Agent with context, permanent memory, and default-on "
+            "OpenAI-hosted web search"
+        ),
         parents=[global_parser],
         prefix_chars='-+'
     )
@@ -296,8 +316,10 @@ def main():
         args.debug = False
     if not hasattr(args, "width"):
         args.width = None
+    if not hasattr(args, "web_search"):
+        args.web_search = True
     if not getattr(args, "command", None):
-        interactive_mode(args.reasoning, args.debug, args.width)
+        interactive_mode(args.reasoning, args.debug, args.width, args.web_search)
     elif args.command == "query":
         single_query(
             args.prompt,
@@ -305,6 +327,7 @@ def main():
             debug=args.debug,
             model=args.model,
             width=args.width,
+            web_search=args.web_search,
         )
     elif args.command == "remember":
         try:

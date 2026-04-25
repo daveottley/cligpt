@@ -5,7 +5,6 @@
 #    pip-compile requirements.in
 #
 annotated-types==0.7.0
-<<<<<<< HEAD
     # via pydantic
 anyio==4.13.0
     # via
@@ -15,54 +14,30 @@ certifi==2026.4.22
     # via
     #   httpcore
     #   httpx
-click==8.3.3
-    # via
-    #   -r requirements.in
-    #   duckduckgo-search
-=======
-anyio==4.12.1
-certifi==2026.2.25
-click==8.3.1
->>>>>>> 341a938 (Remove requirements.txt.old. Dont need.)
 distro==1.9.0
     # via openai
-duckduckgo-search==8.1.1
-    # via -r requirements.in
 h11==0.16.0
     # via httpcore
 httpcore==1.0.9
     # via httpx
 httpx==0.28.1
-<<<<<<< HEAD
-    # via
-    #   -r requirements.in
-    #   openai
+    # via openai
 idna==3.13
     # via
     #   anyio
     #   httpx
 jiter==0.14.0
     # via openai
-lxml==6.1.0
-    # via
-    #   -r requirements.in
-    #   duckduckgo-search
 openai==2.32.0
     # via -r requirements.in
-primp==1.2.3
-    # via duckduckgo-search
 pydantic==2.13.3
-    # via
-    #   -r requirements.in
-    #   openai
+    # via openai
 pydantic-core==2.46.3
     # via pydantic
 sniffio==1.3.1
     # via openai
 tqdm==4.67.3
-    # via
-    #   -r requirements.in
-    #   openai
+    # via openai
 typing-extensions==4.15.0
     # via
     #   openai
@@ -71,19 +46,3 @@ typing-extensions==4.15.0
     #   typing-inspection
 typing-inspection==0.4.2
     # via pydantic
-=======
-idna==3.11
-jiter==0.13.0
-lxml==6.0.2
-openai==2.26.0
-packaging==26.0
-primp==1.1.2
-pydantic==2.12.5
-pydantic_core==2.41.5
-setuptools==82.0.1
-sniffio==1.3.1
-tqdm==4.67.3
-typing-inspection==0.4.2
-typing_extensions==4.15.0
-wheel==0.46.3
->>>>>>> 341a938 (Remove requirements.txt.old. Dont need.)
