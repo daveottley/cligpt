@@ -4,7 +4,6 @@ import sys
 import os
 import platform
 import datetime
-import json
 import re
 from openai import OpenAI
 from config import MAX_CONTEXT_TOKENS, MODEL, FAST_MODEL, PRESENCE_PENALTY, SYSTEM_MESSAGE_FILE
@@ -19,28 +18,9 @@ import time
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# JSON schema for structured outputs
-RESPONSE_SCHEMA = {
-    "name": "StructuredOutput",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "answer": {"type": "string", "description": "The answer text."},
-            "topics": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "List of up to 5 unique topic tags (from broad to specific)."
-            },
-            "reasoning_tokens": {
-                "type": "integer",
-                "description": "A non-negative integer indicating the reasoning tokens used."
-            }
-        },
-        "required": ["answer", "topics", "reasoning_tokens"],
-        "additionalProperties": False
-    }
-}
+def supports_reasoning_effort(model):
+    """Return whether the model family accepts the reasoning_effort parameter."""
+    return model.startswith(("gpt-5", "o1", "o3", "o4"))
 
 def load_system_message():
     """Load and format the system message from SYSTEM_MESSAGE_FILE."""
@@ -80,7 +60,7 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
     Send a query to the AI using the specified reasoning effort.
     A header is printed at the beginning of each response:
       [<model_name> - <reasoning_effort>]
-    Streaming is disabled.
+    The assistant response is streamed to stdout as it is received.
     """
     # Default parameters if not provided.
     if not reasoning_effort:
@@ -120,44 +100,53 @@ def single_query(user_prompt, reasoning_effort="medium", debug=False, model=None
         {"role": "user", "content": user_prompt}
     ]
     
-    # Always disable streaming.
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        max_completion_tokens=MAX_CONTEXT_TOKENS,
-        response_format={"type": "json_schema", "json_schema": RESPONSE_SCHEMA},
-        n=1,
-        presence_penalty=PRESENCE_PENALTY,
-        stream=False,
-        store=True
-    )
-    
-    raw_content = response.choices[0].message.content
-    
-    if raw_content is None:
-        raw_content = ""
-    try:
-        structured_output = json.loads(raw_content)
-    except json.JSONDecodeError:
-        structured_output = {
-            "answer": raw_content,
-            "topics": [],
-            "reasoning_tokens": 0
-        }
-        
-    answer_text = structured_output.get("answer", "")
-    topics = structured_output.get("topics", [])
-    reasoning_tokens_used = structured_output.get("reasoning_tokens", 0)
-    
-    if debug:
-        header2 = f"[Reasoning Tokens: {reasoning_tokens_used}]\n"
-        full_output = header2 + "\n" + answer_text
-    else:
-        full_output = answer_text
+    request_args = {
+        "model": model,
+        "messages": messages,
+        "max_completion_tokens": MAX_CONTEXT_TOKENS,
+        "n": 1,
+        "presence_penalty": PRESENCE_PENALTY,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "store": True
+    }
+    if supports_reasoning_effort(model):
+        request_args["reasoning_effort"] = reasoning_effort
 
-    sys.stdout.write("\n" + full_output + "\n")
+    stream = client.chat.completions.create(**request_args)
+
+    answer_chunks = []
+    reasoning_tokens_used = 0
+
+    if debug:
+        sys.stdout.write("[streaming response]\n\n")
+    else:
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+
+    for chunk in stream:
+        if getattr(chunk, "usage", None):
+            completion_details = getattr(chunk.usage, "completion_tokens_details", None)
+            reasoning_tokens_used = getattr(completion_details, "reasoning_tokens", 0) or 0
+            continue
+
+        if not chunk.choices:
+            continue
+
+        delta = chunk.choices[0].delta
+        content = getattr(delta, "content", None)
+        if content:
+            answer_chunks.append(content)
+            sys.stdout.write(content)
+            sys.stdout.flush()
+
+    answer_text = "".join(answer_chunks)
+
+    if debug:
+        sys.stdout.write(f"\n\n[Reasoning Tokens: {reasoning_tokens_used}]\n")
+    else:
+        sys.stdout.write("\n")
     sys.stdout.flush()
     
-    add_to_context(user_prompt, answer_text, topics, reasoning_effort)
-    return full_output
-
+    add_to_context(user_prompt, answer_text, [], reasoning_effort)
+    return answer_text
