@@ -6,6 +6,7 @@ import datetime
 import re
 import json
 import subprocess
+import uuid
 from config import MODEL, CONTEXT_FILE, PERMANENT_MEMORY_FILE, DELIMITER, MAX_CONTEXT_TOKENS
 
 REQUIRED_PERMANENT_MEMORIES = ["name", "topics_of_interest"]
@@ -181,12 +182,20 @@ def prune_context(user_prompt):
             oldest_timestamp = min(times).strftime("%Y-%m-%d %H:%M:%S")
     return pruned_context, len(selected_blocks), topic_tags, oldest_timestamp
 
-def add_to_context(user_prompt, answer_text, topics, reasoning_effort="medium"):
+def add_to_context(user_prompt, answer_text, topics, reasoning_effort="medium", response_id=None):
     """
     Append a new conversation block to the context file.
     """
+    if response_id is None:
+        response_id = str(uuid.uuid4())
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     topics_str = ", ".join(topics) if topics else "None"
-    block = f"[{timestamp}]\n>>> {user_prompt}\n[{MODEL} - {reasoning_effort}] {answer_text}\nTopic Tags: {topics_str}"
+    block = (
+        f"[{timestamp}]\n"
+        f"Response ID: {response_id}\n"
+        f">>> {user_prompt}\n"
+        f"[{MODEL} - {reasoning_effort}] {answer_text}\n"
+        f"Topic Tags: {topics_str}"
+    )
     save_context_block(block)
-
+    return response_id

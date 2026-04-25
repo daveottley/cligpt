@@ -2,6 +2,7 @@ import sys
 import re
 import subprocess
 import argparse
+import shlex
 from ai_client import single_query
 from config import MODEL
 from memory_manager import (
@@ -55,7 +56,7 @@ def positive_int(value):
     return parsed
 
 def has_default_query_prompt(argv):
-    options_with_values = {"--width", "--model", "-m"}
+    options_with_values = {"--width", "--model", "-m", "--file", "--image", "--directory", "--blob"}
     index = 0
     while index < len(argv):
         arg = argv[index]
@@ -95,7 +96,7 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width
     print("  :forget-memory <id>  : Remove a permanent memory by its ID")
     print("  :export-memory <file>: Export permanent memories to the specified file")
     print("You can adjust flags on the fly by prepending your input with them.")
-    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --width <num>")
+    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --width <num>, --file <file>, --image <image>, --blob <file>, --directory <dir>")
     print("If only flags are provided, a confirmation message is printed.")
     
     try:
@@ -117,6 +118,11 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width
                 print("  :forget-memory <id>    : Remove a long-term memory by its ID")
                 print("  :export-memory <file>  : Export long-term memories to a file")
                 print("  Flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --width <num>")
+                print("  Uploads: --file <file>, --image <png|jpg|jpeg|webp|gif>, --blob <file>, --directory <dir>")
+                print("  --file accepts PDFs, LibreOffice documents, and raw text/code files.")
+                print("  --blob sends a text report with metadata, hashes, hex preview, and strings.")
+                print("  Directory uploads recurse and include supported files/blobs, up to 500 files.")
+                print("  Docs: https://platform.openai.com/docs/guides/pdf-files and https://platform.openai.com/docs/guides/images-vision")
                 print("  Web search is enabled by default. Use --no-web for offline/model-only answers.")
                 print("  Type your query directly to send it to the AI.")
                 continue
@@ -166,31 +172,49 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width
                 print(f"Permanent memories exported to {output_file}.")
                 continue
 
-            # Split the input into tokens.
-            tokens = user_input.split()
+            # Split the input into shell-like tokens so paths can be quoted.
+            try:
+                tokens = shlex.split(user_input)
+            except ValueError as exc:
+                print(f"Could not parse input: {exc}")
+                continue
             recognized_flags = {"+debug", "+d", "-debug", "-d", "--high", "-high", "-h",
                                "--medium", "-medium", "-m", "--low", "-low", "-l",
                                "--web", "--no-web"}
             flag_tokens = []
             query_tokens = []
+            file_paths = []
+            image_paths = []
+            blob_paths = []
+            directory_paths = []
             index = 0
             malformed_flag = False
             while index < len(tokens):
                 token = tokens[index]
-                if token == "--width":
+                if token in {"--width", "--file", "--image", "--blob", "--directory"}:
                     if index + 1 >= len(tokens):
-                        print("Usage: --width <num>")
+                        print(f"Usage: {token} <value>")
                         malformed_flag = True
                         break
-                    try:
-                        width_value = int(tokens[index + 1])
-                        if width_value < 1:
-                            raise ValueError
-                    except ValueError:
-                        print("Width must be a positive integer.")
-                        malformed_flag = True
-                        break
-                    flag_tokens.append(("--width", width_value))
+                    value = tokens[index + 1]
+                    if token == "--width":
+                        try:
+                            width_value = int(value)
+                            if width_value < 1:
+                                raise ValueError
+                        except ValueError:
+                            print("Width must be a positive integer.")
+                            malformed_flag = True
+                            break
+                        flag_tokens.append(("--width", width_value))
+                    elif token == "--file":
+                        file_paths.append(value)
+                    elif token == "--image":
+                        image_paths.append(value)
+                    elif token == "--blob":
+                        blob_paths.append(value)
+                    elif token == "--directory":
+                        directory_paths.append(value)
                     index += 2
                     continue
                 if token in recognized_flags:
@@ -228,17 +252,26 @@ def interactive_mode(initial_reasoning_effort, initial_debug_mode, initial_width
                     print(f"Response width set to {current_width}.")
             # If only flags were provided, reprint the header with updated settings.
             if not query_tokens:
+                if file_paths or image_paths or blob_paths or directory_paths:
+                    print("Upload flags apply to a query. Add a prompt after the upload paths.")
                 print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width, current_web_search))
             else:
                 # Otherwise, join query tokens into a query string and process it.
                 query = " ".join(query_tokens)
-                single_query(
-                    query,
-                    reasoning_effort=current_reasoning_effort,
-                    debug=current_debug_mode,
-                    width=current_width,
-                    web_search=current_web_search,
-                )
+                try:
+                    single_query(
+                        query,
+                        reasoning_effort=current_reasoning_effort,
+                        debug=current_debug_mode,
+                        width=current_width,
+                        web_search=current_web_search,
+                        file_paths=file_paths,
+                        image_paths=image_paths,
+                        blob_paths=blob_paths,
+                        directory_paths=directory_paths,
+                    )
+                except ValueError as exc:
+                    print(exc)
     except (KeyboardInterrupt, EOFError):
         print("\nExiting interactive mode.")
 
@@ -271,6 +304,18 @@ def parse_args():
     global_parser.add_argument("--no-web", dest="web_search", action="store_false",
                                default=argparse.SUPPRESS,
                                help="Disable default web search for this request")
+    global_parser.add_argument("--file", dest="file_paths", action="append",
+                               default=argparse.SUPPRESS, metavar="FILE",
+                               help="Upload a PDF, LibreOffice-convertible document, or raw text/code file. Docs: https://platform.openai.com/docs/guides/pdf-files")
+    global_parser.add_argument("--image", dest="image_paths", action="append",
+                               default=argparse.SUPPRESS, metavar="IMAGE",
+                               help="Upload an image for this request: PNG, JPEG, WEBP, or non-animated GIF. Docs: https://platform.openai.com/docs/guides/images-vision")
+    global_parser.add_argument("--blob", dest="blob_paths", action="append",
+                               default=argparse.SUPPRESS, metavar="FILE",
+                               help="Analyze an arbitrary binary by attaching a text report with metadata, hashes, hex preview, and strings")
+    global_parser.add_argument("--directory", dest="directory_paths", action="append",
+                               default=argparse.SUPPRESS, metavar="DIR",
+                               help="Recursively include supported files and binary blob reports from DIR, up to 500 files")
     
     # Create the main parser.
     parser = argparse.ArgumentParser(
@@ -318,17 +363,32 @@ def main():
         args.width = None
     if not hasattr(args, "web_search"):
         args.web_search = True
+    if not hasattr(args, "file_paths"):
+        args.file_paths = []
+    if not hasattr(args, "image_paths"):
+        args.image_paths = []
+    if not hasattr(args, "blob_paths"):
+        args.blob_paths = []
+    if not hasattr(args, "directory_paths"):
+        args.directory_paths = []
     if not getattr(args, "command", None):
         interactive_mode(args.reasoning, args.debug, args.width, args.web_search)
     elif args.command == "query":
-        single_query(
-            args.prompt,
-            reasoning_effort=args.reasoning,
-            debug=args.debug,
-            model=args.model,
-            width=args.width,
-            web_search=args.web_search,
-        )
+        try:
+            single_query(
+                args.prompt,
+                reasoning_effort=args.reasoning,
+                debug=args.debug,
+                model=args.model,
+                width=args.width,
+                web_search=args.web_search,
+                file_paths=args.file_paths,
+                image_paths=args.image_paths,
+                blob_paths=args.blob_paths,
+                directory_paths=args.directory_paths,
+            )
+        except ValueError as exc:
+            print(exc)
     elif args.command == "remember":
         try:
             entry = add_permanent_memory(args.text)

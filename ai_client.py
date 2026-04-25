@@ -6,14 +6,27 @@ import platform
 import json
 import shutil
 import datetime
+import uuid
+import mimetypes
+import subprocess
+import tempfile
+import hashlib
+import string
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.request import pathname2url
 from openai import OpenAI
-from config import MAX_CONTEXT_TOKENS, MODEL, FAST_MODEL, SYSTEM_MESSAGE_FILE, CONTEXT_FILE
+from config import (
+    MAX_CONTEXT_TOKENS,
+    MODEL,
+    FAST_MODEL,
+    SYSTEM_MESSAGE_FILE,
+    SOURCES_DIR,
+    MAX_UPLOAD_FILES,
+)
 from memory_manager import (
         get_neofetch_output,
         prune_context,
         add_to_context,
-        save_context_block,
 )
 
 # Initialize OpenAI client
@@ -37,9 +50,358 @@ TOPIC_TAG_SCHEMA = {
     }
 }
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+PDF_EXTENSIONS = {".pdf"}
+TEXT_EXTENSIONS = {
+    ".txt", ".text", ".md", ".markdown", ".rst", ".csv", ".tsv", ".json",
+    ".jsonl", ".yaml", ".yml", ".toml", ".xml", ".html", ".htm", ".css",
+    ".js", ".jsx", ".ts", ".tsx", ".py", ".rb", ".go", ".rs", ".java",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".cs", ".php", ".swift",
+    ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".fish", ".ps1",
+    ".bat", ".cmd", ".sql", ".ini", ".cfg", ".conf", ".log", ".dockerfile",
+    ".makefile", ".mk", ".lua", ".vim", ".el", ".lisp", ".clj", ".ex",
+    ".exs", ".erl", ".hrl", ".fs", ".fsx", ".r", ".m", ".pl", ".pm",
+}
+LIBREOFFICE_EXTENSIONS = {
+    ".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm",
+    ".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt", ".xltx", ".xltm",
+    ".ppt", ".pptx", ".pptm", ".pot", ".potx", ".potm", ".pps", ".ppsx", ".ppsm",
+    ".odt", ".ott", ".fodt", ".ods", ".ots", ".fods", ".odp", ".otp", ".fodp",
+    ".odg", ".otg", ".fodg", ".odf", ".rtf", ".wpd", ".wps",
+    ".sxw", ".stw", ".sxc", ".stc", ".sxi", ".sti", ".sxd", ".std",
+}
+IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+PDF_MIME_TYPES = {"application/pdf"}
+TEXT_MIME_PREFIXES = ("text/",)
+TEXT_MIME_TYPES = {
+    "application/json",
+    "application/x-ndjson",
+    "application/xml",
+    "application/x-yaml",
+    "application/toml",
+    "application/javascript",
+    "application/x-sh",
+}
+LIBREOFFICE_COMMAND = shutil.which("libreoffice") or shutil.which("soffice")
+FILE_COMMAND = shutil.which("file")
+BINWALK_COMMAND = shutil.which("binwalk")
+HEX_PREVIEW_BYTES = 512
+STRING_PREVIEW_LIMIT = 200
+STRING_MIN_LENGTH = 4
+
 def supports_reasoning_effort(model):
     """Return whether the model family accepts the reasoning_effort parameter."""
     return model.startswith(("gpt-5", "o1", "o3", "o4"))
+
+def normalize_paths(paths):
+    return [path for path in (paths or []) if path]
+
+def file_magic_kind(path):
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+    except OSError:
+        return None
+
+    if header.startswith(b"%PDF"):
+        return "file"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image"
+    if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+        return "image"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return "image"
+    return None
+
+def classify_upload_path(path, requested_kind=None):
+    suffix = os.path.splitext(path)[1].lower()
+    mime_type, _ = mimetypes.guess_type(path)
+    magic_kind = file_magic_kind(path)
+    is_text = (
+        suffix in TEXT_EXTENSIONS
+        or mime_type in TEXT_MIME_TYPES
+        or (mime_type or "").startswith(TEXT_MIME_PREFIXES)
+    )
+    is_office = suffix in LIBREOFFICE_EXTENSIONS
+
+    if requested_kind == "image":
+        if suffix in IMAGE_EXTENSIONS or mime_type in IMAGE_MIME_TYPES or magic_kind == "image":
+            return "image"
+        raise ValueError(f"--image only accepts PNG, JPEG, WEBP, or non-animated GIF files: {path}")
+
+    if requested_kind == "file":
+        if suffix in PDF_EXTENSIONS or mime_type in PDF_MIME_TYPES or magic_kind == "file":
+            return "file"
+        if is_office:
+            return "office"
+        if is_text:
+            return "text"
+        raise ValueError(
+            "--file accepts PDFs, LibreOffice-convertible documents, and raw text/code files: "
+            f"{path}"
+        )
+
+    if requested_kind == "blob":
+        return "blob"
+
+    if suffix in IMAGE_EXTENSIONS or mime_type in IMAGE_MIME_TYPES or magic_kind == "image":
+        return "image"
+    if suffix in PDF_EXTENSIONS or mime_type in PDF_MIME_TYPES or magic_kind == "file":
+        return "file"
+    if is_office:
+        return "office"
+    if is_text:
+        return "text"
+    return None
+
+def iter_directory_files(directory):
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = sorted(
+            dirname for dirname in dirs
+            if not dirname.startswith(".") and dirname != "__pycache__"
+        )
+        for filename in sorted(files):
+            if filename.startswith("."):
+                continue
+            yield os.path.join(root, filename)
+
+def collect_uploads(file_paths=None, image_paths=None, directory_paths=None, blob_paths=None):
+    uploads = []
+    seen_paths = set()
+
+    def add_path(path, requested_kind=None, skip_unsupported=False, blob_fallback=False):
+        full_path = os.path.abspath(os.path.expanduser(path))
+        if full_path in seen_paths:
+            return
+        if not os.path.isfile(full_path):
+            raise ValueError(f"Upload path is not a file: {path}")
+        kind = classify_upload_path(full_path, requested_kind=requested_kind)
+        if kind is None:
+            if blob_fallback:
+                kind = "blob"
+            elif skip_unsupported:
+                return
+            else:
+                raise ValueError(f"Unsupported upload file type: {path}")
+        uploads.append({"path": full_path, "kind": kind})
+        seen_paths.add(full_path)
+        if len(uploads) > MAX_UPLOAD_FILES:
+            raise ValueError(f"Too many upload files. The hard limit is {MAX_UPLOAD_FILES}.")
+
+    for path in normalize_paths(file_paths):
+        add_path(path, requested_kind="file")
+    for path in normalize_paths(image_paths):
+        add_path(path, requested_kind="image")
+    for path in normalize_paths(blob_paths):
+        add_path(path, requested_kind="blob")
+    for directory in normalize_paths(directory_paths):
+        full_directory = os.path.abspath(os.path.expanduser(directory))
+        if not os.path.isdir(full_directory):
+            raise ValueError(f"--directory path is not a directory: {directory}")
+        for path in iter_directory_files(full_directory):
+            add_path(path, blob_fallback=True)
+
+    return uploads
+
+def upload_file_for_response(upload):
+    purpose = "vision" if upload["kind"] == "image" else "user_data"
+    with open(upload["path"], "rb") as f:
+        uploaded = client.files.create(file=f, purpose=purpose)
+    return {
+        "path": upload["path"],
+        "kind": upload["kind"],
+        "file_id": uploaded.id,
+    }
+
+def convert_office_to_pdf(path, output_directory):
+    if not LIBREOFFICE_COMMAND:
+        raise ValueError(
+            "LibreOffice is required to convert this file to PDF, but no libreoffice/soffice "
+            f"command was found: {path}"
+        )
+
+    profile_directory = os.path.join(output_directory, "lo-profile")
+    os.makedirs(profile_directory, exist_ok=True)
+    profile_uri = "file://" + pathname2url(os.path.abspath(profile_directory))
+
+    result = subprocess.run(
+        [
+            LIBREOFFICE_COMMAND,
+            "--headless",
+            f"-env:UserInstallation={profile_uri}",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            output_directory,
+            path,
+        ],
+        text=True,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise ValueError(f"LibreOffice failed to convert {path} to PDF: {detail}")
+
+    expected = os.path.join(
+        output_directory,
+        os.path.splitext(os.path.basename(path))[0] + ".pdf",
+    )
+    if os.path.exists(expected):
+        return expected
+
+    converted = [
+        os.path.join(output_directory, filename)
+        for filename in os.listdir(output_directory)
+        if filename.lower().endswith(".pdf")
+    ]
+    if converted:
+        return max(converted, key=os.path.getmtime)
+    raise ValueError(f"LibreOffice did not produce a PDF for {path}")
+
+def read_text_attachment(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    return {
+        "path": path,
+        "kind": "text",
+        "text": text,
+    }
+
+def bytes_to_hex_lines(data, start_offset=0, width=16):
+    lines = []
+    for index in range(0, len(data), width):
+        chunk = data[index:index + width]
+        hex_bytes = " ".join(f"{byte:02x}" for byte in chunk)
+        ascii_text = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in chunk)
+        lines.append(f"{start_offset + index:08x}  {hex_bytes:<47}  {ascii_text}")
+    return "\n".join(lines)
+
+def printable_strings(data, min_length=STRING_MIN_LENGTH):
+    allowed = set(bytes(string.printable, "ascii")) - {0x0b, 0x0c}
+    results = []
+    current = bytearray()
+    for byte in data:
+        if byte in allowed and byte not in {0x0a, 0x0d, 0x09}:
+            current.append(byte)
+        else:
+            if len(current) >= min_length:
+                results.append(current.decode("ascii", errors="replace"))
+            current = bytearray()
+    if len(current) >= min_length:
+        results.append(current.decode("ascii", errors="replace"))
+    return results
+
+def run_optional_command(command):
+    if not command[0]:
+        return "unavailable"
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception as exc:
+        return f"unavailable: {exc}"
+    output = (result.stdout or result.stderr or "").strip()
+    return output if output else f"exit code {result.returncode}, no output"
+
+def build_blob_report(path):
+    stat = os.stat(path)
+    with open(path, "rb") as f:
+        data = f.read()
+
+    sha256 = hashlib.sha256(data).hexdigest()
+    sha1 = hashlib.sha1(data).hexdigest()
+    md5 = hashlib.md5(data).hexdigest()
+    first_bytes = data[:HEX_PREVIEW_BYTES]
+    last_bytes = data[-HEX_PREVIEW_BYTES:] if len(data) > HEX_PREVIEW_BYTES else b""
+    strings_preview = printable_strings(data)[:STRING_PREVIEW_LIMIT]
+    mime_type, encoding = mimetypes.guess_type(path)
+    file_output = run_optional_command([FILE_COMMAND, "--brief", path]) if FILE_COMMAND else "unavailable"
+    binwalk_output = run_optional_command([BINWALK_COMMAND, path]) if BINWALK_COMMAND else "unavailable"
+
+    lines = [
+        f"Binary blob analysis report for: {path}",
+        f"Size: {stat.st_size} bytes",
+        f"MIME guess: {mime_type or 'unknown'}",
+        f"Encoding guess: {encoding or 'unknown'}",
+        f"file(1): {file_output}",
+        f"SHA256: {sha256}",
+        f"SHA1: {sha1}",
+        f"MD5: {md5}",
+        "",
+        f"First {len(first_bytes)} bytes:",
+        bytes_to_hex_lines(first_bytes),
+    ]
+    if last_bytes:
+        lines.extend([
+            "",
+            f"Last {len(last_bytes)} bytes:",
+            bytes_to_hex_lines(last_bytes, start_offset=max(0, len(data) - len(last_bytes))),
+        ])
+    lines.extend([
+        "",
+        f"Printable strings, first {len(strings_preview)} of up to {STRING_PREVIEW_LIMIT}:",
+    ])
+    lines.extend(strings_preview or ["None found."])
+    lines.extend([
+        "",
+        "binwalk:",
+        binwalk_output,
+    ])
+    return "\n".join(lines)
+
+def read_blob_attachment(path):
+    return {
+        "path": path,
+        "kind": "blob",
+        "text": build_blob_report(path),
+    }
+
+def upload_attachments(file_paths=None, image_paths=None, directory_paths=None, blob_paths=None):
+    uploads = collect_uploads(file_paths, image_paths, directory_paths, blob_paths)
+    attachments = []
+    with tempfile.TemporaryDirectory(prefix="cligpt-upload-") as temp_directory:
+        for upload in uploads:
+            if upload["kind"] == "text":
+                attachments.append(read_text_attachment(upload["path"]))
+            elif upload["kind"] == "blob":
+                attachments.append(read_blob_attachment(upload["path"]))
+            elif upload["kind"] == "office":
+                conversion_directory = tempfile.mkdtemp(dir=temp_directory)
+                pdf_path = convert_office_to_pdf(upload["path"], conversion_directory)
+                uploaded = upload_file_for_response({"path": pdf_path, "kind": "file"})
+                uploaded["source_path"] = upload["path"]
+                uploaded["converted_path"] = pdf_path
+                attachments.append(uploaded)
+            else:
+                attachments.append(upload_file_for_response(upload))
+    return attachments
+
+def build_user_content(user_prompt, uploaded_attachments):
+    content = [{"type": "input_text", "text": user_prompt}]
+    for attachment in uploaded_attachments:
+        if attachment["kind"] == "image":
+            content.append({"type": "input_image", "file_id": attachment["file_id"]})
+        elif attachment["kind"] in {"text", "blob"}:
+            label = "binary blob report" if attachment["kind"] == "blob" else "text file"
+            content.append({
+                "type": "input_text",
+                "text": (
+                    f"\n\n--- Begin attached {label}: {attachment['path']} ---\n"
+                    f"{attachment['text']}\n"
+                    f"--- End attached {label}: {attachment['path']} ---"
+                ),
+            })
+        else:
+            content.append({"type": "input_file", "file_id": attachment["file_id"]})
+    return content
 
 def resolve_output_width(width=None):
     if width:
@@ -137,13 +499,27 @@ def collect_uncited_web_sources(response, cited_urls):
 
     return sources
 
-def log_uncited_web_sources(user_prompt, sources):
+def source_file_path(response_id):
+    return os.path.join(SOURCES_DIR, f"{response_id}.txt")
+
+def source_file_link(response_id):
+    return f"sources/{response_id}.txt"
+
+def save_source_block(response_id, block):
+    os.makedirs(SOURCES_DIR, exist_ok=True)
+    path = source_file_path(response_id)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(block + "\n")
+    return path
+
+def log_uncited_web_sources(response_id, user_prompt, sources):
     if not sources:
         return None
 
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
-        f"[{timestamp}]",
+        f"Response ID: {response_id}",
+        f"Timestamp: {timestamp}",
         "Uncited web-search sources returned by the OpenAI web search tool.",
         "These sources were not final-answer citations.",
         f">>> {user_prompt}",
@@ -155,8 +531,7 @@ def log_uncited_web_sources(user_prompt, sources):
             f"URL: {source['url']}",
             f"Complete source text: {source['text']}",
         ])
-    save_context_block("\n".join(lines))
-    return os.path.abspath(CONTEXT_FILE)
+    return save_source_block(response_id, "\n".join(lines))
 
 class StreamingLineWrapper:
     def __init__(self, width):
@@ -282,6 +657,10 @@ def single_query(
     model=None,
     width=None,
     web_search=True,
+    file_paths=None,
+    image_paths=None,
+    directory_paths=None,
+    blob_paths=None,
 ):
     """
     Send a query to the AI using the specified reasoning effort.
@@ -294,7 +673,9 @@ def single_query(
         reasoning_effort = "medium"
     if not model:
         model = MODEL
+    response_id = str(uuid.uuid4())
     output_width, width_source = resolve_output_width(width)
+    uploaded_attachments = upload_attachments(file_paths, image_paths, directory_paths, blob_paths)
 
     system_message = load_system_message()
     pruned_context, chat_blocks, topic_tags, oldest_block = prune_context(user_prompt)
@@ -305,6 +686,7 @@ def single_query(
     context_tokens = estimate_tokens_local(pruned_context)
     user_tokens = estimate_tokens_local(user_prompt)
     total_context_tokens = system_tokens + context_tokens + user_tokens
+    attachment_count = len(uploaded_attachments)
 
     # Build header
     web_label = "web:on" if web_search else "web:off"
@@ -317,6 +699,7 @@ def single_query(
                     f"    [Oldest Block: {oldest_block}]\n"
                     f"  [User Prompt: {user_tokens}]\n"
                     f"  [Web Search: {'enabled' if web_search else 'disabled'}]\n"
+                    f"  [Attachments: {attachment_count}]\n"
                     f"  [Output Width: {output_width} ({width_source})]\n")
     
     if debug:
@@ -345,7 +728,7 @@ def single_query(
     request_args = {
         "model": model,
         "instructions": combined_system,
-        "input": [{"role": "user", "content": user_prompt}],
+        "input": [{"role": "user", "content": build_user_content(user_prompt, uploaded_attachments)}],
         "max_output_tokens": MAX_CONTEXT_TOKENS,
         "stream": True,
         "text": {"format": {"type": "text"}},
@@ -422,11 +805,10 @@ def single_query(
         collect_uncited_web_sources(completed_response, cited_urls)
         if completed_response else []
     )
-    uncited_context_path = log_uncited_web_sources(user_prompt, uncited_sources)
-    if uncited_context_path:
+    if log_uncited_web_sources(response_id, user_prompt, uncited_sources):
         note = (
             "\n*Additional web-search sources were returned but not cited in "
-            f"the final answer; they were logged to {uncited_context_path}.*"
+            f"the final answer, logged in your [context]({source_file_link(response_id)}).*"
         )
         sys.stdout.write(note + "\n")
         answer_text += note
@@ -443,5 +825,5 @@ def single_query(
         if debug:
             sys.stderr.write(f"[Topic tag extraction failed: {exc}]\n")
         topics = []
-    add_to_context(user_prompt, answer_text, topics, reasoning_effort)
+    add_to_context(user_prompt, answer_text, topics, reasoning_effort, response_id=response_id)
     return answer_text
