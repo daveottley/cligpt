@@ -29,6 +29,7 @@ from config import (
     MAX_DIRECTORY_FILES,
     MAX_DIRECT_VISION_UPLOADS,
     MAX_UPLOAD_RETRIES,
+    DEFAULT_VECTOR_STORE_EXPIRATION_DAYS,
     DEFAULT_INDEX_CONCURRENCY,
     DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_IDLE_TIMEOUT_SECONDS,
@@ -1482,6 +1483,90 @@ def directory_usage_summary(vector_contexts):
         if context.get("vector_store_id"):
             totals["stores"].append(context["vector_store_id"])
     return totals
+
+def format_timestamp(timestamp):
+    if not timestamp:
+        return "never"
+    try:
+        return datetime.datetime.fromtimestamp(timestamp).isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        return str(timestamp)
+
+def file_counts_text(file_counts):
+    if not file_counts:
+        return "unknown"
+    if hasattr(file_counts, "model_dump"):
+        data = file_counts.model_dump()
+    elif isinstance(file_counts, dict):
+        data = file_counts
+    else:
+        data = {
+            name: getattr(file_counts, name)
+            for name in ("in_progress", "completed", "failed", "cancelled", "total")
+            if hasattr(file_counts, name)
+        }
+    return ", ".join(f"{key}:{value}" for key, value in sorted(data.items()))
+
+def expires_after_text(expires_after):
+    if not expires_after:
+        return "none"
+    if hasattr(expires_after, "model_dump"):
+        data = expires_after.model_dump()
+    elif isinstance(expires_after, dict):
+        data = expires_after
+    else:
+        data = {
+            name: getattr(expires_after, name)
+            for name in ("anchor", "days")
+            if hasattr(expires_after, name)
+        }
+    anchor = data.get("anchor", "unknown")
+    days = data.get("days", "unknown")
+    return f"{days} day(s) after {anchor}"
+
+def print_index_list():
+    manager = VectorStoreManager(client)
+    stores = manager.list_indexes()
+    if not stores:
+        print("No vector stores found.")
+        return
+    total_bytes = sum(store["usage_bytes"] for store in stores)
+    print(f"Vector stores: {len(stores)} total usage: {format_bytes(total_bytes)}")
+    for store in sorted(stores, key=lambda item: item.get("created_at") or 0, reverse=True):
+        metadata = store.get("metadata") or {}
+        print(f"{store['id']}  {store['name']}")
+        print(f"  usage: {format_bytes(store['usage_bytes'])}")
+        print(f"  files: {file_counts_text(store['file_counts'])}")
+        print(f"  created: {format_timestamp(store['created_at'])}")
+        print(f"  last active: {format_timestamp(store['last_active_at'])}")
+        print(f"  expires: {expires_after_text(store['expires_after'])}")
+        if metadata.get("cligpt_root_fingerprint"):
+            print(f"  cligpt fingerprint: {metadata.get('cligpt_root_fingerprint')[:16]}")
+
+def delete_index(vector_store_id):
+    manager = VectorStoreManager(client)
+    manager.delete_index(vector_store_id)
+    print(f"Deleted vector store: {vector_store_id}")
+
+def expire_index(vector_store_id, days=DEFAULT_VECTOR_STORE_EXPIRATION_DAYS):
+    manager = VectorStoreManager(client)
+    manager.expire_index(vector_store_id, days=days)
+    print(f"Set expiration for {vector_store_id}: {days} day(s) after last_active_at")
+
+def print_index_duplicates():
+    manager = VectorStoreManager(client)
+    duplicates = manager.duplicate_indexes()
+    if not duplicates:
+        print("No cligpt vector-store duplicates found.")
+        return
+    for index, group in enumerate(duplicates, start=1):
+        print(f"Duplicate group {index}:")
+        for store in sorted(group, key=lambda item: item.get("created_at") or 0, reverse=True):
+            print(
+                f"  {store['id']} {store['name']} "
+                f"usage:{format_bytes(store['usage_bytes'])} "
+                f"created:{format_timestamp(store['created_at'])}"
+            )
 
 def build_usage_summary(
     completed_response,

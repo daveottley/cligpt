@@ -161,6 +161,10 @@ Use `--wait-index` to force cligpt to finish syncing before the query, or
 You can manage directory indexes directly:
   sync-directory ./case-files --index-concurrency 8
   index-status ./case-files
+  index-list
+  index-duplicates
+  index-expire vs_... --days 7
+  index-delete vs_...
 
 `sync-directory` is resumable/idempotent: unchanged files reuse existing OpenAI
 file IDs, changed files are re-indexed, failed files are retried on the next
@@ -208,6 +212,12 @@ remote index locally and avoids a duplicate vector store. Adopted remote indexes
 do not have local per-file state on the new machine until a full sync is run, so
 normal queries reuse the existing vector store while explicit `sync-directory`
 can rebuild local per-file tracking if needed.
+
+New cligpt vector stores default to a 7-day expiration policy anchored to
+`last_active_at`. Use `index-expire vs_... --days N` to adjust retention,
+`index-list` to inspect storage usage, and `index-delete vs_...` to remove a
+store immediately. Deleting vector stores stops future vector-store storage
+charges for those stores.
 
 The `.cligpt/` directory is ignored by Git and should remain local-only. It can
 contain vector-store metadata and sync logs tied to private business documents.

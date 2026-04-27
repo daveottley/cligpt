@@ -4,6 +4,10 @@ import subprocess
 import argparse
 import shlex
 from ai_client import (
+    delete_index,
+    expire_index,
+    print_index_duplicates,
+    print_index_list,
     print_directory_status,
     single_query,
     sync_directory_vector_stores,
@@ -14,6 +18,7 @@ from config import (
     DEFAULT_IDLE_TIMEOUT_SECONDS,
     DEFAULT_OUTPUT_STYLE,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_VECTOR_STORE_EXPIRATION_DAYS,
 )
 from model_capabilities import get_model_capabilities
 from memory_manager import (
@@ -373,7 +378,8 @@ def parse_args():
     argv = sys.argv[1:]
     subcmds = {
         "query", "remember", "view-memory", "forget-memory", "export-memory",
-        "sync-directory", "index-status",
+        "sync-directory", "index-status", "index-list", "index-delete",
+        "index-expire", "index-duplicates",
     }
     if not any(arg in subcmds for arg in argv) and has_default_query_prompt(argv):
         argv = ["query"] + argv
@@ -481,6 +487,27 @@ def parse_args():
                                           help="Show local sync status for a directory search index",
                                           prefix_chars='-+')
     parser_status.add_argument("directory", nargs="+", help="Directory path(s) to inspect")
+
+    subparsers.add_parser("index-list", parents=[global_parser],
+                          help="List OpenAI vector stores and storage usage",
+                          prefix_chars='-+')
+
+    parser_delete = subparsers.add_parser("index-delete", parents=[global_parser],
+                                          help="Delete an OpenAI vector store by id",
+                                          prefix_chars='-+')
+    parser_delete.add_argument("vector_store_id", help="Vector store id, e.g. vs_...")
+
+    parser_expire = subparsers.add_parser("index-expire", parents=[global_parser],
+                                          help="Set vector store expiration by id",
+                                          prefix_chars='-+')
+    parser_expire.add_argument("vector_store_id", help="Vector store id, e.g. vs_...")
+    parser_expire.add_argument("--days", type=positive_int,
+                               default=DEFAULT_VECTOR_STORE_EXPIRATION_DAYS,
+                               help=f"Days after last_active_at before expiration (default: {DEFAULT_VECTOR_STORE_EXPIRATION_DAYS})")
+
+    subparsers.add_parser("index-duplicates", parents=[global_parser],
+                          help="List likely duplicate cligpt vector stores",
+                          prefix_chars='-+')
     
     return parser.parse_args(argv)
 
@@ -584,6 +611,14 @@ def main():
         sync_directory_vector_stores(args.directory, index_concurrency=args.index_concurrency)
     elif args.command == "index-status":
         print_directory_status(args.directory)
+    elif args.command == "index-list":
+        print_index_list()
+    elif args.command == "index-delete":
+        delete_index(args.vector_store_id)
+    elif args.command == "index-expire":
+        expire_index(args.vector_store_id, days=args.days)
+    elif args.command == "index-duplicates":
+        print_index_duplicates()
 
 if __name__ == "__main__":
     main()

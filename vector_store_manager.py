@@ -11,6 +11,7 @@ from openai import OpenAI
 
 from config import (
     DEFAULT_INDEX_CONCURRENCY,
+    DEFAULT_VECTOR_STORE_EXPIRATION_DAYS,
     INDEX_ETA_INTERVAL_FILES,
     INDEX_ETA_INTERVAL_SECONDS,
     STATE_DIR,
@@ -137,6 +138,39 @@ class VectorStoreManager:
         metadata = getattr(vector_store, "metadata", None)
         return metadata or {}
 
+    def desired_metadata(self, root_path, uploads):
+        fingerprint = directory_identity_fingerprint(root_path, uploads)
+        metadata = {
+            "cligpt_schema_version": "1",
+            "cligpt_api_key_hash": self.api_key_hash(),
+            "cligpt_root_fingerprint": fingerprint,
+            "cligpt_root_hash": root_hash(root_path),
+            "cligpt_root_basename": os.path.basename(root_path)[:512],
+            "cligpt_created_by": "cligpt",
+        }
+        return metadata
+
+    def update_vector_store_policy(self, vector_store_id, root_path=None, uploads=None):
+        update_kwargs = {
+            "expires_after": {
+                "anchor": "last_active_at",
+                "days": DEFAULT_VECTOR_STORE_EXPIRATION_DAYS,
+            },
+        }
+        if root_path is not None:
+            try:
+                existing = self.client.vector_stores.retrieve(vector_store_id)
+                metadata = self.vector_store_metadata(existing).copy()
+            except Exception:
+                metadata = {}
+            metadata.update(self.desired_metadata(root_path, uploads or []))
+            update_kwargs["metadata"] = metadata
+        try:
+            self.client.vector_stores.update(vector_store_id=vector_store_id, **update_kwargs)
+        except Exception as exc:
+            sys.stderr.write(f"[Vector store policy update failed for {vector_store_id}: {exc}]\n")
+            sys.stderr.flush()
+
     def discover_remote_corpus(self, root_path, uploads):
         fingerprint = directory_identity_fingerprint(root_path, uploads)
         expected_key_hash = self.api_key_hash()
@@ -227,7 +261,9 @@ class VectorStoreManager:
                 (root_path,),
             ).fetchone()
             if existing:
-                return dict(existing)
+                existing = dict(existing)
+                self.update_vector_store_policy(existing["vector_store_id"], root_path, uploads or [])
+                return existing
 
             fingerprint = directory_identity_fingerprint(root_path, uploads)
             remote = self.discover_remote_corpus(root_path, uploads)
@@ -237,21 +273,75 @@ class VectorStoreManager:
             name = portable_corpus_name(root_path, fingerprint)
             vector_store = self.client.vector_stores.create(
                 name=name,
+                expires_after={
+                    "anchor": "last_active_at",
+                    "days": DEFAULT_VECTOR_STORE_EXPIRATION_DAYS,
+                },
                 metadata={
-                    "cligpt_schema_version": "1",
-                    "cligpt_api_key_hash": self.api_key_hash(),
-                    "cligpt_root_fingerprint": fingerprint,
-                    "cligpt_root_hash": root_hash(root_path),
-                    "cligpt_root_basename": os.path.basename(root_path)[:512],
-                    "cligpt_created_by": "cligpt",
+                    **self.desired_metadata(root_path, uploads or []),
                 },
             )
             self.insert_corpus_row(db, root_path, vector_store.id, name, created_at=now)
             db.commit()
-            return dict(db.execute(
-                "SELECT * FROM corpora WHERE root_path = ?",
-                (root_path,),
-            ).fetchone())
+        return dict(db.execute(
+            "SELECT * FROM corpora WHERE root_path = ?",
+            (root_path,),
+        ).fetchone())
+
+    def iter_vector_stores(self):
+        after = None
+        while True:
+            kwargs = {"limit": 100}
+            if after:
+                kwargs["after"] = after
+            page = self.client.vector_stores.list(**kwargs)
+            data = getattr(page, "data", []) or []
+            for vector_store in data:
+                yield vector_store
+            if not getattr(page, "has_more", False) or not data:
+                break
+            after = getattr(data[-1], "id", None)
+            if not after:
+                break
+
+    def list_indexes(self):
+        stores = []
+        for listed_store in self.iter_vector_stores():
+            try:
+                store = self.client.vector_stores.retrieve(listed_store.id)
+            except Exception:
+                store = listed_store
+            stores.append({
+                "id": getattr(store, "id", ""),
+                "name": getattr(store, "name", "") or "",
+                "usage_bytes": getattr(store, "usage_bytes", 0) or 0,
+                "file_counts": getattr(store, "file_counts", None),
+                "created_at": getattr(store, "created_at", None),
+                "last_active_at": getattr(store, "last_active_at", None),
+                "expires_after": getattr(store, "expires_after", None),
+                "metadata": self.vector_store_metadata(store),
+            })
+        return stores
+
+    def delete_index(self, vector_store_id):
+        return self.client.vector_stores.delete(vector_store_id)
+
+    def expire_index(self, vector_store_id, days=DEFAULT_VECTOR_STORE_EXPIRATION_DAYS):
+        return self.client.vector_stores.update(
+            vector_store_id=vector_store_id,
+            expires_after={"anchor": "last_active_at", "days": int(days)},
+        )
+
+    def duplicate_indexes(self):
+        grouped = {}
+        for store in self.list_indexes():
+            metadata = store.get("metadata") or {}
+            fingerprint = metadata.get("cligpt_root_fingerprint")
+            key_hash = metadata.get("cligpt_api_key_hash")
+            if not fingerprint or not key_hash:
+                continue
+            grouped.setdefault((key_hash, fingerprint), []).append(store)
+        return [stores for stores in grouped.values() if len(stores) > 1]
 
     def find_corpus(self, root_path):
         root_path = os.path.abspath(os.path.expanduser(root_path))
