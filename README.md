@@ -200,6 +200,15 @@ and SHA256 metadata. Files deleted locally are removed from the vector store on
 the next sync. Files that still fail after retries are skipped and reported to
 the model.
 
+Vector stores are also tagged with portable OpenAI metadata derived from a
+directory identity fingerprint. When the same OpenAI API key indexes the same
+network directory from another machine, cligpt checks existing OpenAI vector
+stores before creating a new one. If it finds a matching store, it adopts that
+remote index locally and avoids a duplicate vector store. Adopted remote indexes
+do not have local per-file state on the new machine until a full sync is run, so
+normal queries reuse the existing vector store while explicit `sync-directory`
+can rebuild local per-file tracking if needed.
+
 The `.cligpt/` directory is ignored by Git and should remain local-only. It can
 contain vector-store metadata and sync logs tied to private business documents.
 Do not commit it.
@@ -284,3 +293,14 @@ With `+debug`, stream lifecycle events are logged to stderr, including when the
 stream opens, tool/search events arrive, first visible text appears, and the
 response completes or fails. Ctrl-C aborts the local wait cleanly and does not
 roll back the reusable directory index.
+
+Every response prints a compact usage footer and appends it to `context.txt`:
+
+```text
+[Usage: input:12,345 output:1,234 reasoning:567 total:13,579 | file_search:1 call(s), 50 result(s) | web_search:0 call(s) | direct_uploads:0 file(s), 0 B | directory:reused 212, uploaded 0, failed 0, pruned 0, remote_adopted 1, background_syncs 0]
+```
+
+This is API-reported token usage plus local sync/upload counters. It is useful
+for spotting accidental re-uploads or duplicate vector-store creation, but it is
+not a perfect real-time billing statement because storage charges and dashboard
+aggregation can lag.

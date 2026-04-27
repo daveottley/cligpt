@@ -973,13 +973,20 @@ def split_uploads_for_directory_search(directory_paths):
         searchable_uploads.append(upload)
     return searchable_uploads, direct_uploads
 
-def directory_sync_status(directory_paths, create=False):
+def directory_sync_status(directory_paths, create=False, adopt_remote=False):
     statuses = []
     for directory in normalize_paths(directory_paths):
         root = os.path.abspath(os.path.expanduser(directory))
         searchable_uploads, _ = split_uploads_for_directory_search([root])
         manager = VectorStoreManager(client)
-        statuses.append(manager.status_for_uploads(root, searchable_uploads, create=create))
+        statuses.append(
+            manager.status_for_uploads(
+                root,
+                searchable_uploads,
+                create=create,
+                adopt_remote=adopt_remote,
+            )
+        )
     return statuses
 
 def directory_sync_log_path(root):
@@ -1098,7 +1105,7 @@ def sync_directory_vector_stores(directory_paths, index_concurrency=DEFAULT_INDE
     return vector_contexts
 
 def print_directory_status(directory_paths):
-    statuses = directory_sync_status(directory_paths)
+    statuses = directory_sync_status(directory_paths, adopt_remote=True)
     for status in statuses:
         counts = status["counts"]
         sync_time = (
@@ -1109,6 +1116,7 @@ def print_directory_status(directory_paths):
         print(f"  Root: {status['root_path']}")
         print(f"  Vector store: {status['vector_store_id']}")
         print(f"  Complete: {'yes' if status['complete'] else 'no'}")
+        print(f"  Remote adopted: {'yes' if status.get('remote_adopted') else 'no'}")
         print(f"  Last sync: {sync_time}")
         print(
             "  Files: "
@@ -1232,6 +1240,7 @@ def build_user_content(user_prompt, uploaded_attachments, vector_contexts=None):
                 f"{stats['reused']} reused, {stats['uploaded']} uploaded, "
                 f"{stats['pruned']} pruned, {stats['failed']} failed"
                 f"{' (partial index)' if stats.get('partial') else ''}"
+                f"{' (adopted remote index; local per-file state unavailable)' if context.get('remote_adopted') else ''}"
             )
             manifest = context.get("manifest")
             if manifest:
@@ -1392,6 +1401,127 @@ def extract_response_text(response):
             if text:
                 chunks.append(text)
     return "".join(chunks)
+
+def response_usage_dict(response, reasoning_tokens=0):
+    usage = getattr(response, "usage", None) if response else None
+    return {
+        "input_tokens": get_nested_attr(usage, "input_tokens", default=0) or 0,
+        "output_tokens": get_nested_attr(usage, "output_tokens", default=0) or 0,
+        "total_tokens": get_nested_attr(usage, "total_tokens", default=0) or 0,
+        "reasoning_tokens": reasoning_tokens or get_nested_attr(
+            usage,
+            "output_tokens_details",
+            "reasoning_tokens",
+            default=0,
+        ) or 0,
+    }
+
+def count_response_tool_items(response):
+    counts = {
+        "file_search_calls": 0,
+        "file_search_results": 0,
+        "web_search_calls": 0,
+    }
+    if not response:
+        return counts
+    for item in getattr(response, "output", []) or []:
+        item_type = getattr(item, "type", "")
+        if item_type == "file_search_call":
+            counts["file_search_calls"] += 1
+            results = getattr(item, "results", None) or []
+            counts["file_search_results"] += len(results)
+        elif item_type == "web_search_call":
+            counts["web_search_calls"] += 1
+    return counts
+
+def direct_attachment_usage(uploaded_attachments):
+    files = 0
+    bytes_total = 0
+    for attachment in uploaded_attachments:
+        if attachment.get("path") == "cligpt upload failures":
+            continue
+        if attachment.get("kind") in {"text", "blob"}:
+            bytes_total += len((attachment.get("text") or "").encode("utf-8"))
+            files += 1
+            continue
+        path = attachment.get("source_path") or attachment.get("path")
+        if path and os.path.exists(path):
+            try:
+                bytes_total += os.path.getsize(path)
+            except OSError:
+                pass
+        files += 1
+    return {"files": files, "bytes": bytes_total}
+
+def format_bytes(value):
+    value = float(value or 0)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+def directory_usage_summary(vector_contexts):
+    totals = {
+        "reused": 0,
+        "uploaded": 0,
+        "failed": 0,
+        "pruned": 0,
+        "remote_adopted": 0,
+        "stores": [],
+    }
+    for context in vector_contexts:
+        stats = context.get("stats", {})
+        totals["reused"] += stats.get("reused", 0) or 0
+        totals["uploaded"] += stats.get("uploaded", 0) or 0
+        totals["failed"] += stats.get("failed", 0) or 0
+        totals["pruned"] += stats.get("pruned", 0) or 0
+        if context.get("remote_adopted"):
+            totals["remote_adopted"] += 1
+        if context.get("vector_store_id"):
+            totals["stores"].append(context["vector_store_id"])
+    return totals
+
+def build_usage_summary(
+    completed_response,
+    reasoning_tokens_used,
+    uploaded_attachments,
+    vector_contexts,
+    stream_event_counts,
+    background_syncs,
+):
+    tokens = response_usage_dict(completed_response, reasoning_tokens_used)
+    tool_counts = count_response_tool_items(completed_response)
+    direct = direct_attachment_usage(uploaded_attachments)
+    directory = directory_usage_summary(vector_contexts)
+    # Stream counts are a fallback when the completed response omits tool details.
+    file_search_calls = tool_counts["file_search_calls"] or (1 if stream_event_counts.get("file_search", 0) else 0)
+    web_search_calls = tool_counts["web_search_calls"] or (1 if stream_event_counts.get("web_search", 0) else 0)
+    line = (
+        "[Usage: "
+        f"input:{tokens['input_tokens']:,} output:{tokens['output_tokens']:,} "
+        f"reasoning:{tokens['reasoning_tokens']:,} total:{tokens['total_tokens']:,} | "
+        f"file_search:{file_search_calls} call(s), {tool_counts['file_search_results']} result(s) | "
+        f"web_search:{web_search_calls} call(s) | "
+        f"direct_uploads:{direct['files']} file(s), {format_bytes(direct['bytes'])} | "
+        f"directory:reused {directory['reused']}, uploaded {directory['uploaded']}, "
+        f"failed {directory['failed']}, pruned {directory['pruned']}, "
+        f"remote_adopted {directory['remote_adopted']}, background_syncs {len(background_syncs)}"
+        "]"
+    )
+    detail = {
+        "tokens": tokens,
+        "tools": {
+            "file_search_calls": file_search_calls,
+            "file_search_results": tool_counts["file_search_results"],
+            "web_search_calls": web_search_calls,
+        },
+        "direct_uploads": direct,
+        "directory": directory,
+        "background_syncs": background_syncs,
+    }
+    return line, detail
 
 def source_to_text(source):
     if isinstance(source, dict):
@@ -1795,6 +1925,7 @@ def single_query(
     visible_chunks = []
     reasoning_tokens_used = 0
     completed_response = None
+    stream_event_counts = Counter()
     wrapper = StreamingLineWrapper(output_width)
 
     if debug:
@@ -1814,6 +1945,10 @@ def single_query(
             idle_timeout_seconds=idle_timeout_seconds,
         ):
             event_type = getattr(event, "type", "")
+            if "file_search" in event_type:
+                stream_event_counts["file_search"] += 1
+            if "web_search" in event_type:
+                stream_event_counts["web_search"] += 1
             if event_type in {"response.output_text.delta", "response.refusal.delta"}:
                 content = getattr(event, "delta", "")
                 if renderer.style == "plain" or not renderer.enabled:
@@ -1879,8 +2014,23 @@ def single_query(
         sys.stdout.write(note + "\n")
         answer_text += note
 
+    usage_line, usage_detail = build_usage_summary(
+        completed_response,
+        reasoning_tokens_used,
+        uploaded_attachments,
+        vector_contexts,
+        stream_event_counts,
+        background_syncs,
+    )
+    sys.stdout.write("\n" + usage_line + "\n")
+    answer_text += "\n" + usage_line
+
     if debug:
-        sys.stdout.write(f"\n\n[Reasoning Tokens: {reasoning_tokens_used}]\n")
+        sys.stdout.write(
+            "\n[Usage Detail]\n"
+            + json.dumps(usage_detail, indent=2, sort_keys=True)
+            + "\n"
+        )
     else:
         sys.stdout.write("\n")
     sys.stdout.flush()

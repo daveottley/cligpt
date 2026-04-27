@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
@@ -24,7 +25,8 @@ CREATE TABLE IF NOT EXISTS corpora (
     vector_store_id TEXT NOT NULL,
     name TEXT NOT NULL,
     created_at REAL NOT NULL,
-    last_sync_at REAL
+    last_sync_at REAL,
+    remote_adopted INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -64,6 +66,10 @@ def connect():
     db = sqlite3.connect(database_path())
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(corpora)").fetchall()}
+    if "remote_adopted" not in columns:
+        db.execute("ALTER TABLE corpora ADD COLUMN remote_adopted INTEGER NOT NULL DEFAULT 0")
+        db.commit()
     return db
 
 
@@ -77,6 +83,32 @@ def sha256_file(path):
 
 def root_hash(path):
     return hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()[:12]
+
+
+def directory_identity_fingerprint(root_path, uploads=None):
+    root_path = os.path.abspath(os.path.expanduser(root_path))
+    basename = os.path.basename(root_path) or "root"
+    rel_paths = []
+    for upload in uploads or []:
+        try:
+            rel_path = os.path.relpath(upload["path"], root_path)
+        except ValueError:
+            continue
+        parts = rel_path.split(os.sep)
+        rel_paths.append(os.path.join(*parts[:2]) if len(parts) > 1 else parts[0])
+    unique_rel_paths = sorted(set(rel_paths))[:1000]
+    payload = {
+        "schema": 1,
+        "basename": basename,
+        "shallow_paths": unique_rel_paths,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def portable_corpus_name(root_path, fingerprint):
+    basename = os.path.basename(os.path.abspath(root_path)) or "root"
+    return f"cligpt:{basename}:{fingerprint[:12]}"
 
 
 def corpus_name(root_path):
@@ -95,7 +127,98 @@ class VectorStoreManager:
             timeout=120.0,
         )
 
-    def ensure_corpus(self, root_path):
+    def api_key_hash(self):
+        api_key = os.getenv("OPENAI_API_KEY") or ""
+        if not api_key:
+            return "missing"
+        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+    def vector_store_metadata(self, vector_store):
+        metadata = getattr(vector_store, "metadata", None)
+        return metadata or {}
+
+    def discover_remote_corpus(self, root_path, uploads):
+        fingerprint = directory_identity_fingerprint(root_path, uploads)
+        expected_key_hash = self.api_key_hash()
+        try:
+            page = self.client.vector_stores.list(limit=100)
+        except Exception as exc:
+            sys.stderr.write(f"[Remote vector-store discovery unavailable: {exc}]\n")
+            sys.stderr.flush()
+            return None
+
+        while True:
+            for vector_store in getattr(page, "data", []) or []:
+                metadata = self.vector_store_metadata(vector_store)
+                if (
+                    metadata.get("cligpt_schema_version") == "1"
+                    and metadata.get("cligpt_root_fingerprint") == fingerprint
+                    and metadata.get("cligpt_api_key_hash") == expected_key_hash
+                ):
+                    return vector_store
+            if not getattr(page, "has_more", False):
+                break
+            after = getattr(getattr(page, "data", [])[-1], "id", None) if getattr(page, "data", None) else None
+            if not after:
+                break
+            try:
+                page = self.client.vector_stores.list(limit=100, after=after)
+            except Exception:
+                break
+        return None
+
+    def adopt_remote_corpus(self, db, root_path, uploads):
+        root_path = os.path.abspath(os.path.expanduser(root_path))
+        remote = self.discover_remote_corpus(root_path, uploads)
+        if not remote:
+            return None
+        fingerprint = directory_identity_fingerprint(root_path, uploads)
+        name = getattr(remote, "name", None) or portable_corpus_name(root_path, fingerprint)
+        sys.stderr.write(f"[Adopted remote vector store: {name} id:{remote.id}]\n")
+        sys.stderr.flush()
+        self.insert_corpus_row(
+            db,
+            root_path,
+            remote.id,
+            name,
+            created_at=time.time(),
+            last_sync_at=time.time(),
+            remote_adopted=True,
+        )
+        db.commit()
+        return dict(db.execute(
+            "SELECT * FROM corpora WHERE root_path = ?",
+            (root_path,),
+        ).fetchone())
+
+    def insert_corpus_row(
+        self,
+        db,
+        root_path,
+        vector_store_id,
+        name,
+        created_at=None,
+        last_sync_at=None,
+        remote_adopted=False,
+    ):
+        now = time.time()
+        db.execute(
+            """
+            INSERT INTO corpora (root_path, root_hash, vector_store_id, name, created_at, last_sync_at, remote_adopted)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                root_path,
+                root_hash(root_path),
+                vector_store_id,
+                name,
+                created_at or now,
+                last_sync_at,
+                1 if remote_adopted else 0,
+            ),
+        )
+
+    def ensure_corpus(self, root_path, uploads=None):
         root_path = os.path.abspath(os.path.expanduser(root_path))
         now = time.time()
         with connect() as db:
@@ -106,21 +229,24 @@ class VectorStoreManager:
             if existing:
                 return dict(existing)
 
-            name = corpus_name(root_path)
+            fingerprint = directory_identity_fingerprint(root_path, uploads)
+            remote = self.discover_remote_corpus(root_path, uploads)
+            if remote:
+                return self.adopt_remote_corpus(db, root_path, uploads)
+
+            name = portable_corpus_name(root_path, fingerprint)
             vector_store = self.client.vector_stores.create(
                 name=name,
                 metadata={
+                    "cligpt_schema_version": "1",
+                    "cligpt_api_key_hash": self.api_key_hash(),
+                    "cligpt_root_fingerprint": fingerprint,
                     "cligpt_root_hash": root_hash(root_path),
                     "cligpt_root_basename": os.path.basename(root_path)[:512],
+                    "cligpt_created_by": "cligpt",
                 },
             )
-            db.execute(
-                """
-                INSERT INTO corpora (root_path, root_hash, vector_store_id, name, created_at, last_sync_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (root_path, root_hash(root_path), vector_store.id, name, now, None),
-            )
+            self.insert_corpus_row(db, root_path, vector_store.id, name, created_at=now)
             db.commit()
             return dict(db.execute(
                 "SELECT * FROM corpora WHERE root_path = ?",
@@ -287,8 +413,8 @@ class VectorStoreManager:
             db.commit()
         return pruned
 
-    def status_for_uploads(self, root_path, uploads, create=False):
-        corpus = self.ensure_corpus(root_path) if create else self.find_corpus(root_path)
+    def status_for_uploads(self, root_path, uploads, create=False, adopt_remote=False):
+        corpus = self.ensure_corpus(root_path, uploads) if create else self.find_corpus(root_path)
         self.current_root = os.path.abspath(os.path.expanduser(root_path))
         current_paths = {upload["path"] for upload in uploads}
         status_counts = {
@@ -302,6 +428,21 @@ class VectorStoreManager:
         }
         examples = {"new": [], "changed": [], "retry": [], "failed": [], "deleted": []}
         if corpus is None:
+            if adopt_remote:
+                with connect() as db:
+                    corpus = self.adopt_remote_corpus(db, self.current_root, uploads)
+            if corpus is not None:
+                status_counts["completed"] = len(uploads)
+                return {
+                    "root_path": self.current_root,
+                    "vector_store_id": corpus["vector_store_id"],
+                    "name": corpus["name"],
+                    "last_sync_at": corpus.get("last_sync_at"),
+                    "complete": True,
+                    "counts": status_counts,
+                    "examples": examples,
+                    "remote_adopted": bool(corpus.get("remote_adopted")),
+                }
             status_counts["new"] = len(uploads)
             examples["new"] = [upload["path"] for upload in uploads[:5]]
             return {
@@ -318,6 +459,18 @@ class VectorStoreManager:
                 "SELECT * FROM files WHERE corpus_id = ?",
                 (corpus["id"],),
             ).fetchall()
+            if corpus.get("remote_adopted") and not rows:
+                status_counts["completed"] = len(uploads)
+                return {
+                    "root_path": self.current_root,
+                    "vector_store_id": corpus["vector_store_id"],
+                    "name": corpus["name"],
+                    "last_sync_at": corpus.get("last_sync_at"),
+                    "complete": True,
+                    "counts": status_counts,
+                    "examples": examples,
+                    "remote_adopted": True,
+                }
             rows_by_path = {row["abs_path"]: dict(row) for row in rows}
             for upload in uploads:
                 row = rows_by_path.get(upload["path"])
@@ -359,6 +512,7 @@ class VectorStoreManager:
             "complete": not bool(incomplete),
             "counts": status_counts,
             "examples": examples,
+            "remote_adopted": bool(corpus.get("remote_adopted")),
         }
 
     def context_for_directory(self, root_path, uploads):
@@ -378,6 +532,7 @@ class VectorStoreManager:
             "stats": stats,
             "failures": [],
             "status": status,
+            "remote_adopted": status.get("remote_adopted", False),
         }
 
     def write_eta(self, completed, total, started_at, force=False):
@@ -432,7 +587,7 @@ class VectorStoreManager:
         index_concurrency=DEFAULT_INDEX_CONCURRENCY,
     ):
         index_concurrency = max(1, int(index_concurrency or DEFAULT_INDEX_CONCURRENCY))
-        corpus = self.ensure_corpus(root_path)
+        corpus = self.ensure_corpus(root_path, uploads)
         self.current_root = os.path.abspath(os.path.expanduser(root_path))
         current_paths = {upload["path"] for upload in uploads}
         stats = {
@@ -519,7 +674,7 @@ class VectorStoreManager:
             maybe_eta(force=True)
         with connect() as db:
             db.execute(
-                "UPDATE corpora SET last_sync_at = ? WHERE id = ?",
+                "UPDATE corpora SET last_sync_at = ?, remote_adopted = 0 WHERE id = ?",
                 (time.time(), corpus["id"]),
             )
             db.commit()
