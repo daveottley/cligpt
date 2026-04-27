@@ -145,8 +145,27 @@ strings, and `binwalk` output when available:
 Use `--image` to upload an image for a request:
   --image ./photo.jpg "What is in this image?"
 
-Use `--directory` to recursively scan a directory and upload supported files:
+Direct `--image` vision attachments are capped at 25 images per request. For
+larger image sets, use `--directory` so images are indexed once and reused.
+
+Use `--directory` to recursively scan a directory and index supported files in
+a reusable OpenAI vector store:
   --directory ./case-files "Find the important details"
+
+If the directory index is incomplete, query mode warns before contacting the
+model. The default interactive choice is to proceed using the files already
+available in the vector store while a non-blocking background sync continues.
+Use `--wait-index` to force cligpt to finish syncing before the query, or
+`--allow-partial-index` to proceed without prompting.
+
+You can manage directory indexes directly:
+  sync-directory ./case-files --index-concurrency 8
+  index-status ./case-files
+
+`sync-directory` is resumable/idempotent: unchanged files reuse existing OpenAI
+file IDs, changed files are re-indexed, failed files are retried on the next
+sync, and deleted local files are pruned from the vector store. Syncs can be
+interrupted and started again later.
 
 Accepted file types:
   - Documents: PDF (`.pdf`)
@@ -159,21 +178,109 @@ Accepted file types:
   - Binary blobs: any file passed with `--blob`, plus otherwise unsupported
     files discovered by `--directory`
 
-Directory uploads include supported documents, images, raw text/code files, and
-blob reports for otherwise unsupported files. cligpt enforces a hard limit of
-500 included files per request to avoid accidentally uploading a large filesystem
+Directory uploads include supported documents, raw text/code files, and blob
+reports for otherwise unsupported files in a vector-store search index. Images
+found in directories are not directly re-uploaded on every query. Document-like
+images are OCR scanned and non-document images are indexed as reusable
+vision-caption/metadata reports. cligpt enforces a hard limit of 5000 included
+directory files per request to avoid accidentally indexing a large filesystem
 tree.
+
+For PDFs in a directory search index, cligpt now prefers local text extraction
+over uploading heavy PDFs. It tries `pdftotext` first, then `ocrmypdf`, then a
+Poppler + Tesseract OCR fallback when needed. This reduces network use and gives
+file search cleaner text for scanned leases and other image-heavy documents. If
+text extraction fails, cligpt falls back to the compressed-PDF upload path.
+
+Each directory gets a durable local corpus entry in `.cligpt/vector_stores.db`
+and a matching OpenAI vector store named like `cligpt:<directory>:<hash>`.
+Unchanged files reuse their existing OpenAI file IDs. Changed files are
+re-uploaded and re-indexed automatically on the next run based on size, mtime,
+and SHA256 metadata. Files deleted locally are removed from the vector store on
+the next sync. Files that still fail after retries are skipped and reported to
+the model.
+
+The `.cligpt/` directory is ignored by Git and should remain local-only. It can
+contain vector-store metadata and sync logs tied to private business documents.
+Do not commit it.
+
+Large PDFs over 10 MB are compressed with Ghostscript before upload when
+possible, with a stronger second pass if the compressed PDF is still over 5 MB.
+This is especially useful for scanned leases and other image-heavy PDFs.
 
 OpenAI's current input docs:
   - PDF files: https://platform.openai.com/docs/guides/pdf-files
+  - File search: https://platform.openai.com/docs/guides/tools-file-search/
   - Images: https://platform.openai.com/docs/guides/images-vision
+
+### Model Context
+
+cligpt uses model capability profiles to advertise and enforce basic limits. The
+default GPT-5-family profile is configured with a 400,000 token context window, a
+100,000 token output cap for cligpt, and a conservative 250,000 token safe input
+budget. Large directories should use `--directory`, which lets the model retrieve
+relevant file chunks with file search instead of forcing every document into the
+prompt context.
+
+As a rough guide, direct file attachment is best for a few files. A directory of
+hundreds of leases, scans, spreadsheets, or photos should be indexed and searched.
+The startup header shows the selected model, context window, safe input budget,
+max output tokens, and whether files are being sent directly or through
+`file_search`.
+
+Directory indexing defaults to 8 concurrent file preparations/uploads. Increase
+or reduce this with `--index-concurrency N` depending on local CPU, network
+quality, and OpenAI API reliability. Sync progress prints `file #/#` and periodic
+elapsed/ETA messages so long runs can be evaluated or aborted.
+
+For current operating reports such as rent rolls, `--directory` also sends a
+compact directory manifest. Paths containing archive/disposed markers such as
+`Old`, `Archive`, `Former`, `Sold`, `Disposed`, `Closed`, `Historical`, or
+`Inactive` are labeled as historical and should be excluded from current rent
+rolls unless the prompt explicitly asks for historical/all/former/sold data.
+The same classification metadata is prepended to text, blob, PDF OCR, and
+Office-converted text indexed for file search so retrieved chunks carry their
+directory status with them.
+
+Images inside `--directory` are indexed instead of re-uploaded on every query.
+Document-like images such as photographed leases are OCR scanned with
+Tesseract and stored as searchable text. Non-document images are indexed as
+reusable vision-caption/metadata reports, which supports broad searches such as
+"which filename is most likely to contain Waldo" without directly attaching
+every image to the request. Direct OpenAI vision attachments are capped at 25
+images; use directory sync for larger image sets.
 
 
 ## Output
 
 When the tool starts, it prints a header in the following format:
-  [mode: <model_name> - reasoning effort: <reasoning_effort> - web: <on|off> - width: <width>]
+  [<model_name> - <reasoning_effort> - web:<on|off> - files:<direct|file_search> - context:<tokens> - safe input:<tokens> - max output:<tokens> - width:<width>]
 
 If the +debug flag is enabled, additional header information and reasoning tokens are printed.
 
 Your response is printed below the debug information and should fit in one terminal window.
+
+Terminal rendering defaults to `--style auto`, which uses a Codex-like Rich
+Markdown panel when stdout is a terminal and plain text when stdout is piped.
+Use:
+
+```text
+--style codex      Render assistant output in Markdown panels
+--style compact    Render Markdown without full panels
+--style plain      Print plain streamed text
+--no-color         Disable ANSI color
+```
+
+Long-running streamed responses print stderr heartbeats while the OpenAI stream
+is silent, so a heavy directory/file-search request does not look dead:
+
+```text
+--heartbeat-seconds N   Waiting message interval, default 30
+--idle-timeout N        Warn after N seconds without stream events, default 600
+--request-timeout N     OpenAI request timeout in seconds, default 3600
+```
+
+With `+debug`, stream lifecycle events are logged to stderr, including when the
+stream opens, tool/search events arrive, first visible text appears, and the
+response completes or fails. Ctrl-C aborts the local wait cleanly and does not
+roll back the reusable directory index.

@@ -3,6 +3,7 @@ conversations/
 context.txt
 sources.txt
 sources/
+.cligpt/
 *.bak
 *.old
 __pycache__/
