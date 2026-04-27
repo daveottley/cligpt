@@ -3,15 +3,6 @@ import re
 import subprocess
 import argparse
 import shlex
-from ai_client import (
-    delete_index,
-    expire_index,
-    print_index_duplicates,
-    print_index_list,
-    print_directory_status,
-    single_query,
-    sync_directory_vector_stores,
-)
 from config import DEFAULT_INDEX_CONCURRENCY, MODEL
 from config import (
     DEFAULT_HEARTBEAT_SECONDS,
@@ -28,6 +19,28 @@ from memory_manager import (
         forget_permanent_memory, 
         export_permanent_memory,
 )
+from maintenance import doctor, update
+
+
+def ai_functions():
+    from ai_client import (
+        delete_index,
+        expire_index,
+        print_index_duplicates,
+        print_index_list,
+        print_directory_status,
+        single_query,
+        sync_directory_vector_stores,
+    )
+    return {
+        "delete_index": delete_index,
+        "expire_index": expire_index,
+        "print_index_duplicates": print_index_duplicates,
+        "print_index_list": print_index_list,
+        "print_directory_status": print_directory_status,
+        "single_query": single_query,
+        "sync_directory_vector_stores": sync_directory_vector_stores,
+    }
 
 def read_multiline_input(prompt=">>> "):
     """
@@ -354,7 +367,8 @@ def interactive_mode(
                 # Otherwise, join query tokens into a query string and process it.
                 query = " ".join(query_tokens)
                 try:
-                    single_query(
+                    funcs = ai_functions()
+                    funcs["single_query"](
                         query,
                         reasoning_effort=current_reasoning_effort,
                         debug=current_debug_mode,
@@ -384,7 +398,7 @@ def parse_args():
     subcmds = {
         "query", "remember", "view-memory", "forget-memory", "export-memory",
         "sync-directory", "index-status", "index-list", "index-delete",
-        "index-expire", "index-duplicates",
+        "index-expire", "index-duplicates", "doctor", "update",
     }
     if not any(arg in subcmds for arg in argv) and has_default_query_prompt(argv):
         argv = ["query"] + argv
@@ -516,6 +530,22 @@ def parse_args():
     subparsers.add_parser("index-duplicates", parents=[global_parser],
                           help="List likely duplicate cligpt vector stores",
                           prefix_chars='-+')
+
+    subparsers.add_parser("doctor", parents=[global_parser],
+                          help="Check Python packages, API key, and local document/OCR tools",
+                          prefix_chars='-+')
+
+    parser_update = subparsers.add_parser("update", parents=[global_parser],
+                                          help="Update cligpt, Python deps, and optionally system tools",
+                                          prefix_chars='-+')
+    parser_update.add_argument("--system", action="store_true",
+                               help="Install missing system tools with the detected package manager")
+    parser_update.add_argument("--skip-git", action="store_true",
+                               help="Do not run git pull")
+    parser_update.add_argument("--skip-pip", action="store_true",
+                               help="Do not update Python requirements")
+    parser_update.add_argument("--dry-run", action="store_true",
+                               help="Print update/install commands without executing them")
     
     return parser.parse_args(argv)
 
@@ -570,7 +600,8 @@ def main():
         )
     elif args.command == "query":
         try:
-            single_query(
+            funcs = ai_functions()
+            funcs["single_query"](
                 args.prompt,
                 reasoning_effort=args.reasoning,
                 debug=args.debug,
@@ -619,17 +650,32 @@ def main():
             "use substantial API tokens/storage.",
             flush=True,
         )
-        sync_directory_vector_stores(args.directory, index_concurrency=args.index_concurrency)
+        funcs = ai_functions()
+        funcs["sync_directory_vector_stores"](args.directory, index_concurrency=args.index_concurrency)
     elif args.command == "index-status":
-        print_directory_status(args.directory)
+        funcs = ai_functions()
+        funcs["print_directory_status"](args.directory)
     elif args.command == "index-list":
-        print_index_list()
+        funcs = ai_functions()
+        funcs["print_index_list"]()
     elif args.command == "index-delete":
-        delete_index(args.vector_store_id)
+        funcs = ai_functions()
+        funcs["delete_index"](args.vector_store_id)
     elif args.command == "index-expire":
-        expire_index(args.vector_store_id, days=args.days)
+        funcs = ai_functions()
+        funcs["expire_index"](args.vector_store_id, days=args.days)
     elif args.command == "index-duplicates":
-        print_index_duplicates()
+        funcs = ai_functions()
+        funcs["print_index_duplicates"]()
+    elif args.command == "doctor":
+        raise SystemExit(doctor())
+    elif args.command == "update":
+        raise SystemExit(update(
+            skip_git=args.skip_git,
+            skip_pip=args.skip_pip,
+            install_system=args.system,
+            dry_run=args.dry_run,
+        ))
 
 if __name__ == "__main__":
     main()

@@ -22,7 +22,7 @@ without maintaining a local scraper dependency.
 **CAUTION:** This program may consume high rates of REAL-WORLD-MONEY depending on token
 usage!
 
-## Requireemnts
+## Requirements
 
 * Python
 * Open AI API keys
@@ -33,7 +33,7 @@ usage!
 Execute the following commands once you have cloned the git repo onto your
 local machine:
 
-~/repo-home > pyhon3 -m venv .venv
+~/repo-home > python3 -m venv .venv
 ~/repo-home > source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -56,6 +56,40 @@ source ./gpt.sh
 
 Once you have access to this function, your use of this program will be much
 easier.
+
+After installation, run:
+
+```bash
+gpt doctor
+```
+
+`doctor` is read-only. It verifies Python packages, `OPENAI_API_KEY`, and
+optional third-party document/OCR tools such as LibreOffice, ocrmypdf,
+Tesseract, Poppler, Ghostscript, `file`, and binwalk. Missing tools do not stop
+basic chat, but they reduce file, directory, OCR, and blob-analysis capability.
+
+Use:
+
+```bash
+gpt update
+```
+
+to pull the latest git changes, update the Python virtual environment from
+`requirements.txt`, and then run the same diagnostic checks. If system tools are
+missing, `update` prints the package-manager command to install them. Use:
+
+```bash
+gpt update --system
+```
+
+to also install missing system tools with the detected package manager
+(`pacman`, `apt`, `dnf`, or `brew`). This may prompt for sudo.
+
+Use a dry run to verify update and install commands without changing the system:
+
+```bash
+gpt update --system --dry-run
+```
 
 ## Use - Flags and Options
 
