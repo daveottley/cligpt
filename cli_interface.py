@@ -133,7 +133,7 @@ def interactive_mode(
     print("  :forget-memory <id>  : Remove a permanent memory by its ID")
     print("  :export-memory <file>: Export permanent memories to the specified file")
     print("You can adjust flags on the fly by prepending your input with them.")
-    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --width <num>, --style <plain|codex|compact>, --no-color, --file <file>, --image <image>, --blob <file>, --directory <dir>, --index-concurrency <num>, --allow-partial-index, --wait-index")
+    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --width <num>, --style <plain|codex|compact>, --no-color, --file <file>, --image <image>, --blob <file>, --directory <dir>, --remote-search, --index-concurrency <num>, --allow-partial-index, --wait-index")
     print("If only flags are provided, a confirmation message is printed.")
     
     try:
@@ -222,7 +222,7 @@ def interactive_mode(
                 continue
             recognized_flags = {"+debug", "+d", "-debug", "-d", "--high", "-high", "-h",
                                "--medium", "-medium", "-m", "--low", "-low", "-l",
-                               "--web", "--no-web", "--allow-partial-index", "--wait-index",
+                               "--web", "--no-web", "--remote-search", "--allow-partial-index", "--wait-index",
                                "--no-color"}
             flag_tokens = []
             query_tokens = []
@@ -231,6 +231,7 @@ def interactive_mode(
             blob_paths = []
             directory_paths = []
             index_concurrency = DEFAULT_INDEX_CONCURRENCY
+            remote_search = False
             allow_partial_index = False
             wait_index = False
             index = 0
@@ -317,6 +318,9 @@ def interactive_mode(
                 elif flag == "--no-web":
                     current_web_search = False
                     print("Web search turned OFF.")
+                elif flag == "--remote-search":
+                    remote_search = True
+                    print("Directory queries will use OpenAI file_search vector stores.")
                 elif flag == "--allow-partial-index":
                     allow_partial_index = True
                     print("Partial directory index queries allowed.")
@@ -361,6 +365,7 @@ def interactive_mode(
                         blob_paths=blob_paths,
                         directory_paths=directory_paths,
                         index_concurrency=index_concurrency,
+                        remote_search=remote_search,
                         allow_partial_index=allow_partial_index,
                         wait_index=wait_index,
                         output_style=current_style,
@@ -418,16 +423,19 @@ def parse_args():
                                help="Analyze an arbitrary binary by attaching a text report with metadata, hashes, hex preview, and strings")
     global_parser.add_argument("--directory", dest="directory_paths", action="append",
                                default=argparse.SUPPRESS, metavar="DIR",
-                               help="Recursively index DIR in a reusable vector store, up to 5000 files; images are OCR/caption indexed and changed files resync automatically. Docs: https://platform.openai.com/docs/guides/tools-file-search/")
+                               help="Recursively search DIR with a local OCR/text cache, up to 5000 files, and send selected snippets. Docs: https://platform.openai.com/docs/guides/tools-file-search/")
+    global_parser.add_argument("--remote-search", dest="remote_search", action="store_true",
+                               default=argparse.SUPPRESS,
+                               help="Use OpenAI file_search vector stores for --directory instead of local preflight search")
     global_parser.add_argument("--index-concurrency", dest="index_concurrency", type=positive_int,
                                default=argparse.SUPPRESS, metavar="N",
                                help=f"Concurrent file indexing uploads for directory syncs (default: {DEFAULT_INDEX_CONCURRENCY})")
     global_parser.add_argument("--allow-partial-index", dest="allow_partial_index", action="store_true",
                                default=argparse.SUPPRESS,
-                               help="For --directory queries, proceed without prompting when the search index is incomplete and start a background sync")
+                               help="With --remote-search, proceed without prompting when the vector index is incomplete and start a background sync")
     global_parser.add_argument("--wait-index", dest="wait_index", action="store_true",
                                default=argparse.SUPPRESS,
-                               help="For --directory queries, sync the directory first before asking the model")
+                               help="With --remote-search, sync the directory vector index before asking the model")
     global_parser.add_argument("--style", dest="output_style",
                                choices=["auto", "plain", "codex", "compact"],
                                default=argparse.SUPPRESS,
@@ -532,6 +540,8 @@ def main():
         args.directory_paths = []
     if not hasattr(args, "index_concurrency"):
         args.index_concurrency = DEFAULT_INDEX_CONCURRENCY
+    if not hasattr(args, "remote_search"):
+        args.remote_search = False
     if not hasattr(args, "allow_partial_index"):
         args.allow_partial_index = False
     if not hasattr(args, "wait_index"):
@@ -572,6 +582,7 @@ def main():
                 blob_paths=args.blob_paths,
                 directory_paths=args.directory_paths,
                 index_concurrency=args.index_concurrency,
+                remote_search=args.remote_search,
                 allow_partial_index=args.allow_partial_index,
                 wait_index=args.wait_index,
                 output_style=args.output_style,

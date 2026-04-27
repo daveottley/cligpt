@@ -46,6 +46,7 @@ from memory_manager import (
 from model_capabilities import get_model_capabilities
 from render import RenderConfig, TerminalRenderer
 from vector_store_manager import VectorStoreManager, root_hash, state_root
+from local_search import LocalSearchIndex, build_local_context
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -966,6 +967,67 @@ def prepare_upload_path_for_search(upload, temp_directory):
         return compress_pdf_for_upload(upload["path"], pdf_directory)
     return upload["path"]
 
+def prepare_image_text_for_local_search(upload, output_directory, metadata_header=""):
+    path = upload["path"]
+    ocr_text = extract_image_text_with_tesseract(path)
+    if meaningful_text_chars(ocr_text) >= IMAGE_DOCUMENT_TEXT_MIN_CHARS:
+        text = "\n".join([
+            metadata_header,
+            f"Extracted text for searchable document image: {path}",
+            "Image handling: document-like image OCR indexed locally.",
+            "",
+            ocr_text,
+        ])
+        return write_text_upload_file(text, path, output_directory, ".image-ocr.txt")
+    text = "\n".join([
+        metadata_header,
+        f"Local metadata for non-document image: {path}",
+        "Image handling: non-document image was not sent to OpenAI for local preflight search.",
+        "Note: broad visual search needs --remote-search or direct --image uploads; local search can only use filename, metadata, and OCR text.",
+        "",
+        image_metadata_report(path),
+        "",
+        "OCR preview:",
+        ocr_text or "No meaningful OCR text detected.",
+    ])
+    return write_text_upload_file(text, path, output_directory, ".image-local.txt")
+
+def prepare_upload_path_for_local_search(upload, temp_directory):
+    metadata = upload_metadata_header(upload)
+    if upload["kind"] == "image":
+        image_directory = tempfile.mkdtemp(dir=temp_directory)
+        return prepare_image_text_for_local_search(upload, image_directory, metadata)
+    if upload["kind"] == "text":
+        text_attachment = read_text_attachment(upload["path"])
+        return write_text_upload_file(metadata + text_attachment["text"], upload["path"], temp_directory)
+    if upload["kind"] == "blob":
+        blob_attachment = read_blob_attachment(upload["path"])
+        return write_text_upload_file(metadata + blob_attachment["text"], upload["path"], temp_directory, ".blob-report.txt")
+    if upload["kind"] == "office":
+        conversion_directory = tempfile.mkdtemp(dir=temp_directory)
+        pdf_path = convert_office_to_pdf(upload["path"], conversion_directory)
+        text_path = prepare_pdf_text_for_search(pdf_path, conversion_directory, metadata)
+        if text_path:
+            return text_path
+        return write_text_upload_file(
+            metadata + f"No OCR text could be extracted from converted office file: {upload['path']}",
+            upload["path"],
+            temp_directory,
+            ".office-local.txt",
+        )
+    if upload["kind"] == "file":
+        pdf_directory = tempfile.mkdtemp(dir=temp_directory)
+        text_path = prepare_pdf_text_for_search(upload["path"], pdf_directory, metadata)
+        if text_path:
+            return text_path
+        return write_text_upload_file(
+            metadata + f"No OCR text could be extracted from PDF: {upload['path']}",
+            upload["path"],
+            temp_directory,
+            ".pdf-local.txt",
+        )
+    return upload["path"]
+
 def split_uploads_for_directory_search(directory_paths):
     searchable_uploads = []
     direct_uploads = []
@@ -973,6 +1035,41 @@ def split_uploads_for_directory_search(directory_paths):
     for upload in directory_uploads:
         searchable_uploads.append(upload)
     return searchable_uploads, direct_uploads
+
+def sync_and_search_local_directories(directory_paths, user_prompt):
+    root_paths = [os.path.abspath(os.path.expanduser(path)) for path in normalize_paths(directory_paths)]
+    uploads = collect_uploads(directory_paths=root_paths)
+    for upload in uploads:
+        role = classify_directory_path(upload["path"], upload.get("root_path"))
+        upload["classification"] = role["classification"]
+    sys.stderr.write(
+        f"[Local directory search: indexing/reusing {len(uploads)} file(s) before model request]\n"
+    )
+    sys.stderr.flush()
+    index = LocalSearchIndex()
+    try:
+        stats = index.sync_uploads(
+            uploads,
+            prepare_upload_path_for_local_search,
+            progress=lambda message: (sys.stderr.write(message), sys.stderr.flush()),
+        )
+        results = index.search(root_paths, user_prompt)
+    finally:
+        index.close()
+    stats["selected"] = len(results)
+    context = {
+        "mode": "local",
+        "root_paths": root_paths,
+        "stats": stats,
+        "results": results,
+        "text": build_local_context(root_paths, user_prompt, stats, results),
+    }
+    sys.stderr.write(
+        f"[Local directory search ready: reused:{stats['reused']} indexed:{stats['indexed']} "
+        f"failed:{stats['failed']} selected:{len(results)}]\n"
+    )
+    sys.stderr.flush()
+    return context
 
 def directory_sync_status(directory_paths, create=False, adopt_remote=False):
     statuses = []
@@ -1227,8 +1324,10 @@ def upload_attachments(file_paths=None, image_paths=None, directory_paths=None, 
         )
     return attachments
 
-def build_user_content(user_prompt, uploaded_attachments, vector_contexts=None):
+def build_user_content(user_prompt, uploaded_attachments, vector_contexts=None, local_context=None):
     content = [{"type": "input_text", "text": user_prompt}]
+    if local_context:
+        content.append({"type": "input_text", "text": local_context["text"]})
     if vector_contexts:
         lines = [
             "Searchable directory corpora are available through the file_search tool.",
@@ -1573,6 +1672,7 @@ def build_usage_summary(
     reasoning_tokens_used,
     uploaded_attachments,
     vector_contexts,
+    local_context,
     stream_event_counts,
     background_syncs,
 ):
@@ -1580,6 +1680,7 @@ def build_usage_summary(
     tool_counts = count_response_tool_items(completed_response)
     direct = direct_attachment_usage(uploaded_attachments)
     directory = directory_usage_summary(vector_contexts)
+    local_stats = (local_context or {}).get("stats", {})
     # Stream counts are a fallback when the completed response omits tool details.
     file_search_calls = tool_counts["file_search_calls"] or (1 if stream_event_counts.get("file_search", 0) else 0)
     web_search_calls = tool_counts["web_search_calls"] or (1 if stream_event_counts.get("web_search", 0) else 0)
@@ -1592,7 +1693,10 @@ def build_usage_summary(
         f"direct_uploads:{direct['files']} file(s), {format_bytes(direct['bytes'])} | "
         f"directory:reused {directory['reused']}, uploaded {directory['uploaded']}, "
         f"failed {directory['failed']}, pruned {directory['pruned']}, "
-        f"remote_adopted {directory['remote_adopted']}, background_syncs {len(background_syncs)}"
+        f"remote_adopted {directory['remote_adopted']}, background_syncs {len(background_syncs)} | "
+        f"local_search:reused {local_stats.get('reused', 0)}, "
+        f"indexed {local_stats.get('indexed', 0)}, failed {local_stats.get('failed', 0)}, "
+        f"selected {local_stats.get('selected', 0)}"
         "]"
     )
     detail = {
@@ -1604,6 +1708,7 @@ def build_usage_summary(
         },
         "direct_uploads": direct,
         "directory": directory,
+        "local_search": local_stats,
         "background_syncs": background_syncs,
     }
     return line, detail
@@ -1838,6 +1943,7 @@ def single_query(
     directory_paths=None,
     blob_paths=None,
     index_concurrency=DEFAULT_INDEX_CONCURRENCY,
+    remote_search=False,
     allow_partial_index=False,
     wait_index=False,
     output_style=DEFAULT_OUTPUT_STYLE,
@@ -1878,37 +1984,42 @@ def single_query(
         )
         sys.stderr.flush()
     vector_contexts = []
+    local_context = None
     background_syncs = []
     if directory_paths:
-        statuses = directory_sync_status(directory_paths, create=True)
-        directory_mode = choose_directory_query_mode(
-            statuses,
-            index_concurrency,
-            allow_partial=allow_partial_index,
-            wait_index=wait_index,
-        )
-        if directory_mode == "cancel":
-            raise ValueError("Directory query cancelled before contacting the model.")
-        if directory_mode == "sync_first":
-            vector_contexts = sync_directory_vector_stores(
-                directory_paths,
-                index_concurrency=index_concurrency,
+        if remote_search:
+            statuses = directory_sync_status(directory_paths, create=True)
+            directory_mode = choose_directory_query_mode(
+                statuses,
+                index_concurrency,
+                allow_partial=allow_partial_index,
+                wait_index=wait_index,
             )
-        elif directory_mode == "partial":
-            background_syncs = start_background_directory_sync(
-                directory_paths,
-                index_concurrency=index_concurrency,
-            )
-            for sync in background_syncs:
-                sys.stderr.write(
-                    f"[Background sync started: pid:{sync['pid']} "
-                    f"log:{sync['log_path']} root:{sync['root_path']}]\n"
+            if directory_mode == "cancel":
+                raise ValueError("Directory query cancelled before contacting the model.")
+            if directory_mode == "sync_first":
+                vector_contexts = sync_directory_vector_stores(
+                    directory_paths,
+                    index_concurrency=index_concurrency,
                 )
-            sys.stderr.flush()
-            vector_contexts = context_for_existing_directory_vector_stores(directory_paths)
+            elif directory_mode == "partial":
+                background_syncs = start_background_directory_sync(
+                    directory_paths,
+                    index_concurrency=index_concurrency,
+                )
+                for sync in background_syncs:
+                    sys.stderr.write(
+                        f"[Background sync started: pid:{sync['pid']} "
+                        f"log:{sync['log_path']} root:{sync['root_path']}]\n"
+                    )
+                sys.stderr.flush()
+                vector_contexts = context_for_existing_directory_vector_stores(directory_paths)
+            else:
+                vector_contexts = context_for_existing_directory_vector_stores(directory_paths)
         else:
-            vector_contexts = context_for_existing_directory_vector_stores(directory_paths)
-    uploaded_attachments = upload_attachments(file_paths, image_paths, directory_paths, blob_paths)
+            local_context = sync_and_search_local_directories(directory_paths, user_prompt)
+    direct_directory_paths = directory_paths if remote_search else None
+    uploaded_attachments = upload_attachments(file_paths, image_paths, direct_directory_paths, blob_paths)
 
     system_message = load_system_message()
     pruned_context, chat_blocks, topic_tags, oldest_block = prune_context(user_prompt)
@@ -1925,7 +2036,12 @@ def single_query(
 
     # Build header
     web_label = "web:on" if web_search else "web:off"
-    file_mode = "file_search" if vector_contexts else "direct"
+    if vector_contexts:
+        file_mode = "file_search"
+    elif local_context:
+        file_mode = "local_search"
+    else:
+        file_mode = "direct"
     header_basic = (
         f"[{model} - {reasoning_effort} - {web_label} - files:{file_mode} - "
         f"context:{capabilities.max_context_tokens:,} - safe input:{capabilities.safe_input_tokens:,} - "
@@ -1941,6 +2057,7 @@ def single_query(
                     f"  [Web Search: {'enabled' if web_search else 'disabled'}]\n"
                     f"  [Attachments: {attachment_count}]\n"
                     f"  [Vector Stores: {vector_store_count}]\n"
+                    f"  [Local Search Chunks: {local_context['stats'].get('selected', 0) if local_context else 0}]\n"
                     f"  [Background Directory Syncs: {len(background_syncs)}]\n"
                     f"  [Model Capability Confidence: {capabilities.confidence}]\n"
                     f"  [Output Width: {output_width} ({width_source})]\n")
@@ -1969,15 +2086,16 @@ def single_query(
             f"\n\nThe selected model has a configured context window of "
             f"{capabilities.max_context_tokens:,} tokens and a conservative "
             f"safe input budget of {capabilities.safe_input_tokens:,} tokens. "
-            f"When file_search is available, prefer targeted retrieval over "
-            f"asking for entire directories to be loaded into context."
+            f"When file_search or local directory search is available, prefer "
+            f"targeted retrieval evidence over assuming entire directories are "
+            f"already loaded into context."
         )
     )
     
     request_args = {
         "model": model,
         "instructions": combined_system,
-        "input": [{"role": "user", "content": build_user_content(user_prompt, uploaded_attachments, vector_contexts)}],
+        "input": [{"role": "user", "content": build_user_content(user_prompt, uploaded_attachments, vector_contexts, local_context)}],
         "max_output_tokens": max_output_tokens,
         "stream": True,
         "text": {"format": {"type": "text"}},
@@ -2104,6 +2222,7 @@ def single_query(
         reasoning_tokens_used,
         uploaded_attachments,
         vector_contexts,
+        local_context,
         stream_event_counts,
         background_syncs,
     )

@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 import ai_client
+from local_search import LocalSearchIndex
 
 
 class UploadAttachmentTests(unittest.TestCase):
@@ -170,6 +171,56 @@ class UploadAttachmentTests(unittest.TestCase):
                 text = handle.read()
             self.assertIn("Searchable image description", text)
             self.assertIn("crowded scene with striped shirt", text)
+
+    def test_local_non_document_image_does_not_call_remote_caption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = os.path.join(directory, "waldo.jpg")
+            with open(image_path, "wb") as handle:
+                handle.write(b"\xff\xd8\xff")
+            upload = {"path": image_path, "kind": "image", "root_path": directory}
+            with mock.patch.object(ai_client, "extract_image_text_with_tesseract", return_value="") as ocr:
+                with mock.patch.object(ai_client, "describe_image_for_search") as describe:
+                    output_path = ai_client.prepare_upload_path_for_local_search(upload, directory)
+
+            ocr.assert_called_once_with(image_path)
+            describe.assert_not_called()
+            self.assertTrue(output_path.endswith(".image-local.txt"))
+            with open(output_path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("non-document image was not sent to OpenAI", text)
+
+    def test_local_search_excludes_archive_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active_dir = os.path.join(directory, "Active")
+            old_dir = os.path.join(directory, "Old")
+            os.makedirs(active_dir)
+            os.makedirs(old_dir)
+            active_path = os.path.join(active_dir, "lease.txt")
+            old_path = os.path.join(old_dir, "lease.txt")
+            with open(active_path, "w", encoding="utf-8") as handle:
+                handle.write("Current tenant Alice pays rent 1000.")
+            with open(old_path, "w", encoding="utf-8") as handle:
+                handle.write("Former tenant Bob pays rent 9999.")
+
+            db_path = os.path.join(directory, "local.sqlite3")
+            index = LocalSearchIndex(db_path=db_path)
+            try:
+                for path in [active_path, old_path]:
+                    upload = {"path": path, "kind": "text", "root_path": directory}
+                    upload["classification"] = ai_client.classify_directory_path(path, directory)["classification"]
+                    with open(path, encoding="utf-8") as handle:
+                        text = handle.read()
+                    index.upsert_upload(upload, ai_client.upload_metadata_header(upload) + text)
+                current_results = index.search([directory], "create current rent roll rent")
+                historical_results = index.search([directory], "create all historical rent roll rent")
+            finally:
+                index.close()
+
+            current_text = "\n".join(result["text"] for result in current_results)
+            historical_text = "\n".join(result["text"] for result in historical_results)
+            self.assertIn("Alice", current_text)
+            self.assertNotIn("Bob", current_text)
+            self.assertIn("Bob", historical_text)
 
 
 if __name__ == "__main__":

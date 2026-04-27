@@ -148,15 +148,24 @@ Use `--image` to upload an image for a request:
 Direct `--image` vision attachments are capped at 25 images per request. For
 larger image sets, use `--directory` so images are indexed once and reused.
 
-Use `--directory` to recursively scan a directory and index supported files in
-a reusable OpenAI vector store:
+Use `--directory` to recursively scan a directory with a local OCR/text cache,
+search that cache before the model request, and send only selected snippets:
   --directory ./case-files "Find the important details"
 
-If the directory index is incomplete, query mode warns before contacting the
-model. The default interactive choice is to proceed using the files already
-available in the vector store while a non-blocking background sync continues.
-Use `--wait-index` to force cligpt to finish syncing before the query, or
-`--allow-partial-index` to proceed without prompting.
+This local preflight search does not upload the whole directory to OpenAI and
+does not give the model direct access to your filesystem. It is the default
+because it is cheaper and faster for questions that can be answered from OCR,
+text layers, filenames, and metadata.
+
+Use `--remote-search` with `--directory` when you want OpenAI file_search vector
+stores instead of local preflight search:
+  --directory ./case-files --remote-search "Find the important details"
+
+In remote-search mode, if the directory index is incomplete, query mode warns
+before contacting the model. The default interactive choice is to proceed using
+the files already available in the vector store while a non-blocking background
+sync continues. Use `--wait-index` to force cligpt to finish syncing before the
+query, or `--allow-partial-index` to proceed without prompting.
 
 You can manage directory indexes directly:
   sync-directory ./case-files --index-concurrency 8
@@ -166,7 +175,8 @@ You can manage directory indexes directly:
   index-expire vs_... --days 7
   index-delete vs_...
 
-`sync-directory` is resumable/idempotent: unchanged files reuse existing OpenAI
+`sync-directory` manages the remote OpenAI file_search index and is
+resumable/idempotent: unchanged files reuse existing OpenAI
 file IDs, changed files are re-indexed, failed files are retried on the next
 sync, and deleted local files are pruned from the vector store. Syncs can be
 interrupted and started again later.
@@ -182,19 +192,21 @@ Accepted file types:
   - Binary blobs: any file passed with `--blob`, plus otherwise unsupported
     files discovered by `--directory`
 
-Directory uploads include supported documents, raw text/code files, and blob
-reports for otherwise unsupported files in a vector-store search index. Images
-found in directories are not directly re-uploaded on every query. Document-like
-images are OCR scanned and non-document images are indexed as reusable
-vision-caption/metadata reports. cligpt enforces a hard limit of 5000 included
-directory files per request to avoid accidentally indexing a large filesystem
-tree.
+Directory searches include supported documents, raw text/code files, and blob
+reports for otherwise unsupported files. Images found in directories are not
+directly re-uploaded on every query. Document-like images are OCR scanned and
+locally searchable like PDFs. In local preflight mode, non-document images are
+indexed by filename, metadata, and OCR preview only; use `--remote-search` or
+direct `--image` uploads for broad visual questions such as finding a specific
+object in a photo set. cligpt enforces a hard limit of 5000 included directory
+files per request to avoid accidentally indexing a large filesystem tree.
 
-For PDFs in a directory search index, cligpt now prefers local text extraction
-over uploading heavy PDFs. It tries `pdftotext` first, then `ocrmypdf`, then a
+For PDFs in directory searches, cligpt prefers local text extraction over
+uploading heavy PDFs. It tries `pdftotext` first, then `ocrmypdf`, then a
 Poppler + Tesseract OCR fallback when needed. This reduces network use and gives
-file search cleaner text for scanned leases and other image-heavy documents. If
-text extraction fails, cligpt falls back to the compressed-PDF upload path.
+cleaner text for scanned leases and other image-heavy documents. In
+`--remote-search` mode, if text extraction fails, cligpt falls back to the
+compressed-PDF upload path.
 
 Each directory gets a durable local corpus entry in `.cligpt/vector_stores.db`
 and a matching OpenAI vector store named like `cligpt:<directory>:<hash>`.
@@ -220,8 +232,8 @@ store immediately. Deleting vector stores stops future vector-store storage
 charges for those stores.
 
 The `.cligpt/` directory is ignored by Git and should remain local-only. It can
-contain vector-store metadata and sync logs tied to private business documents.
-Do not commit it.
+contain local search cache data, vector-store metadata, and sync logs tied to
+private business documents. Do not commit it.
 
 Large PDFs over 10 MB are compressed with Ghostscript before upload when
 possible, with a stronger second pass if the compressed PDF is still over 5 MB.
@@ -237,9 +249,10 @@ OpenAI's current input docs:
 cligpt uses model capability profiles to advertise and enforce basic limits. The
 default GPT-5-family profile is configured with a 400,000 token context window, a
 100,000 token output cap for cligpt, and a conservative 250,000 token safe input
-budget. Large directories should use `--directory`, which lets the model retrieve
-relevant file chunks with file search instead of forcing every document into the
-prompt context.
+budget. Large directories should use `--directory`, which locally selects
+relevant file chunks before the request instead of forcing every document into
+the prompt context. Use `--remote-search` when local snippets are not enough and
+you want OpenAI file_search to retrieve from a remote vector store.
 
 As a rough guide, direct file attachment is best for a few files. A directory of
 hundreds of leases, scans, spreadsheets, or photos should be indexed and searched.
@@ -307,10 +320,10 @@ roll back the reusable directory index.
 Every response prints a compact usage footer and appends it to `context.txt`:
 
 ```text
-[Usage: input:12,345 output:1,234 reasoning:567 total:13,579 | file_search:1 call(s), 50 result(s) | web_search:0 call(s) | direct_uploads:0 file(s), 0 B | directory:reused 212, uploaded 0, failed 0, pruned 0, remote_adopted 1, background_syncs 0]
+[Usage: input:12,345 output:1,234 reasoning:567 total:13,579 | file_search:1 call(s), 50 result(s) | web_search:0 call(s) | direct_uploads:0 file(s), 0 B | directory:reused 212, uploaded 0, failed 0, pruned 0, remote_adopted 1, background_syncs 0 | local_search:reused 300, indexed 2, failed 0, selected 18]
 ```
 
-This is API-reported token usage plus local sync/upload counters. It is useful
-for spotting accidental re-uploads or duplicate vector-store creation, but it is
-not a perfect real-time billing statement because storage charges and dashboard
-aggregation can lag.
+This is API-reported token usage plus local search and sync/upload counters. It
+is useful for spotting accidental re-uploads, duplicate vector-store creation, or
+over-broad local retrieval, but it is not a perfect real-time billing statement
+because storage charges and dashboard aggregation can lag.
