@@ -430,10 +430,10 @@ class UploadAttachmentTests(unittest.TestCase):
         self.assertNotIn("[OpenAI stream event: response.output_text.delta]", output)
         self.assertNotIn("[OpenAI stream event: response.completed]", output)
 
-    def test_stream_event_debug_line_formats_count_and_grouped_dots(self):
+    def test_stream_event_debug_line_formats_count(self):
         self.assertEqual(
             ai_client.format_stream_event_debug_line(12),
-            "[OpenAI Stream Events: 12] ..... ..... ..",
+            "[OpenAI Stream Events: 12]",
         )
 
     def test_request_input_debug_breakdown_includes_actual_payload_parts(self):

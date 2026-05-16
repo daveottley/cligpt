@@ -1405,19 +1405,8 @@ def format_duration(seconds):
         return f"{minutes}m{second:02d}s"
     return f"{second}s"
 
-def format_stream_event_dots(count):
-    count = max(0, int(count))
-    groups = []
-    while count:
-        group_size = min(5, count)
-        groups.append("." * group_size)
-        count -= group_size
-    return " ".join(groups)
-
 def format_stream_event_debug_line(count):
-    dots = format_stream_event_dots(count)
-    suffix = f" {dots}" if dots else ""
-    return f"[OpenAI Stream Events: {max(0, int(count))}]{suffix}"
+    return f"[OpenAI Stream Events: {max(0, int(count))}]"
 
 def iter_stream_with_heartbeat(
     stream,
@@ -2276,7 +2265,6 @@ def build_usage_summary(
         "local_search": local_stats,
         "stream_events": {
             "total": stream_event_counts.get("total", 0),
-            "dots": format_stream_event_dots(stream_event_counts.get("total", 0)),
             "by_type": {
                 key.removeprefix("type:"): count
                 for key, count in sorted(stream_event_counts.items())
