@@ -90,6 +90,26 @@ class CliInterfaceTests(unittest.TestCase):
         self.assertNotIn("--file", help_text)
         self.assertNotIn("--raw", help_text)
 
+    def test_top_level_help_is_concise_command_index(self):
+        stdout = io.StringIO()
+
+        with mock.patch.object(sys, "argv", ["cligpt.py", "--help"]):
+            with contextlib.redirect_stdout(stdout):
+                with self.assertRaises(SystemExit):
+                    cli_interface.parse_args()
+
+        help_text = stdout.getvalue()
+        self.assertIn("usage: gpt command [args]", help_text)
+        self.assertIn("CLI Help Agent with context/memory management, web search, and tool use", help_text)
+        self.assertIn("commands:", help_text)
+        self.assertIn("  query", help_text)
+        self.assertIn("  remember", help_text)
+        self.assertIn('Options vary per command. Run "gpt command --help" for detailed options.', help_text)
+        self.assertNotIn("{query,remember", help_text)
+        self.assertNotIn("positional arguments:", help_text)
+        self.assertNotIn("Available subcommands", help_text)
+        self.assertNotIn("--directory", help_text)
+
     def test_memory_aliases_parse(self):
         with mock.patch.object(sys, "argv", ["cligpt.py", "forget", "3"]):
             args = cli_interface.parse_args()

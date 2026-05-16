@@ -87,6 +87,26 @@ def positive_int(value):
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
 
+class TopLevelHelpParser(argparse.ArgumentParser):
+    def format_help(self):
+        command_help = getattr(self, "command_help", [])
+        lines = [
+            "usage: gpt command [args]",
+            "",
+            "CLI Help Agent with context/memory management, web search, and tool use",
+            "",
+            "commands:",
+        ]
+        for command, help_text in command_help:
+            lines.append(f"  {command:<18} {help_text}")
+        lines.extend([
+            "",
+            "options:",
+            '  Options vary per command. Run "gpt command --help" for detailed options.',
+            "",
+        ])
+        return "\n".join(lines)
+
 def has_default_query_prompt(argv):
     options_with_values = {
         "--width", "--model", "-m", "--file", "--image", "--directory",
@@ -561,15 +581,38 @@ def parse_args():
                                help=f"Prompt cache retention policy (default: {DEFAULT_PROMPT_CACHE_RETENTION}; auto uses 24h for GPT-5-family models)")
     
     # Create the main parser.
-    parser = argparse.ArgumentParser(
+    parser = TopLevelHelpParser(
+        prog="gpt",
         description=(
-            "CLI GPT Help Agent with context, permanent memory, and default-on "
-            "OpenAI-hosted web search"
+            "CLI Help Agent with context/memory management, web search, and tool use"
         ),
         parents=[global_parser],
         prefix_chars='-+'
     )
-    subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        metavar="command",
+        parser_class=argparse.ArgumentParser,
+    )
+    parser.command_help = [
+        ("query", "Run a one-off query"),
+        ("remember", "Save a permanent memory"),
+        ("view-memory", "View permanent memories"),
+        ("memories", "View permanent memories"),
+        ("forget-memory", "Forget a permanent memory by its stable ID"),
+        ("forget", "Forget a permanent memory by its stable ID"),
+        ("edit-memory", "Replace a permanent memory by its stable ID"),
+        ("update-memory", "Replace a permanent memory by its stable ID"),
+        ("export-memory", "Export permanent memories to a file"),
+        ("sync-directory", "Synchronize a directory into its reusable file-search index"),
+        ("index-status", "Show local sync status for a directory search index"),
+        ("index-list", "List OpenAI vector stores and storage usage"),
+        ("index-delete", "Delete an OpenAI vector store by id"),
+        ("index-expire", "Set vector store expiration by id"),
+        ("index-duplicates", "List likely duplicate cligpt vector stores"),
+        ("doctor", "Check Python packages, API key, and local document/OCR tools"),
+        ("update", "Update cligpt, Python deps, and optionally system tools"),
+    ]
     
     # Define subcommands.
     parser_query = subparsers.add_parser("query", parents=[global_parser],
