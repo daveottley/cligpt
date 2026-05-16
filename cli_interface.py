@@ -708,26 +708,29 @@ def parse_args():
     )
     parser_export.add_argument("output", type=str, help="Output file path")
 
-    parser_sync = subparsers.add_parser("sync-directory", parents=[global_parser],
+    parser_sync = subparsers.add_parser("sync-directory",
                                         help="Synchronize a directory into its reusable file-search index",
                                         prefix_chars='-+')
     parser_sync.add_argument("directory", nargs="+", help="Directory path(s) to sync")
+    parser_sync.add_argument("--index-concurrency", dest="index_concurrency", type=positive_int,
+                             default=DEFAULT_INDEX_CONCURRENCY, metavar="N",
+                             help=f"Concurrent file indexing uploads (default: {DEFAULT_INDEX_CONCURRENCY})")
 
-    parser_status = subparsers.add_parser("index-status", parents=[global_parser],
+    parser_status = subparsers.add_parser("index-status",
                                           help="Show local sync status for a directory search index",
                                           prefix_chars='-+')
     parser_status.add_argument("directory", nargs="+", help="Directory path(s) to inspect")
 
-    subparsers.add_parser("index-list", parents=[global_parser],
+    subparsers.add_parser("index-list",
                           help="List OpenAI vector stores and storage usage",
                           prefix_chars='-+')
 
-    parser_delete = subparsers.add_parser("index-delete", parents=[global_parser],
+    parser_delete = subparsers.add_parser("index-delete",
                                           help="Delete an OpenAI vector store by id",
                                           prefix_chars='-+')
     parser_delete.add_argument("vector_store_id", help="Vector store id, e.g. vs_...")
 
-    parser_expire = subparsers.add_parser("index-expire", parents=[global_parser],
+    parser_expire = subparsers.add_parser("index-expire",
                                           help="Set vector store expiration by id",
                                           prefix_chars='-+')
     parser_expire.add_argument("vector_store_id", help="Vector store id, e.g. vs_...")
@@ -735,17 +738,32 @@ def parse_args():
                                default=DEFAULT_VECTOR_STORE_EXPIRATION_DAYS,
                                help=f"Days after last_active_at before expiration (default: {DEFAULT_VECTOR_STORE_EXPIRATION_DAYS})")
 
-    subparsers.add_parser("index-duplicates", parents=[global_parser],
+    subparsers.add_parser("index-duplicates",
                           help="List likely duplicate cligpt vector stores",
                           prefix_chars='-+')
 
-    subparsers.add_parser("doctor", parents=[global_parser],
-                          help="Check Python packages, API key, and local document/OCR tools",
-                          prefix_chars='-+')
+    subparsers.add_parser(
+        "doctor",
+        help="Check Python packages, API key, and local document/OCR tools",
+        description=(
+            "Run a read-only environment check. Doctor reports required Python "
+            "packages, OPENAI_API_KEY, and optional document/OCR/blob tools, then "
+            "prints suggested install commands for missing system tools."
+        ),
+        prefix_chars='-+',
+    )
 
-    parser_update = subparsers.add_parser("update", parents=[global_parser],
-                                          help="Update cligpt, Python deps, and optionally system tools",
-                                          prefix_chars='-+')
+    parser_update = subparsers.add_parser(
+        "update",
+        help="Update cligpt, Python deps, and optionally system tools",
+        description=(
+            "Update the local cligpt checkout and Python virtual environment. "
+            "With --system, update also installs missing optional system tools "
+            "through the detected package manager, and asks before installing "
+            "AUR packages."
+        ),
+        prefix_chars='-+',
+    )
     parser_update.add_argument("--system", action="store_true",
                                help="Install missing system tools with the detected package manager")
     parser_update.add_argument("--skip-git", action="store_true",

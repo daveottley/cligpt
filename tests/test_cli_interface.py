@@ -149,6 +149,85 @@ class CliInterfaceTests(unittest.TestCase):
         self.assertEqual(args.id, 3)
         self.assertEqual(args.text, "name: David")
 
+    def test_doctor_help_omits_query_options(self):
+        stdout = io.StringIO()
+
+        with mock.patch.object(sys, "argv", ["cligpt.py", "doctor", "--help"]):
+            with contextlib.redirect_stdout(stdout):
+                with self.assertRaises(SystemExit):
+                    cli_interface.parse_args()
+
+        help_text = stdout.getvalue()
+        self.assertIn("usage: gpt doctor [-h]", help_text)
+        self.assertIn("Run a read-only environment check", help_text)
+        self.assertIn("optional document/OCR/blob tools", help_text)
+        self.assertNotIn("--directory", help_text)
+        self.assertNotIn("--file", help_text)
+        self.assertNotIn("+debug", help_text)
+        self.assertNotIn("--prompt-cache", help_text)
+
+    def test_non_query_subcommand_help_omits_query_options(self):
+        commands = [
+            "remember",
+            "view-memory",
+            "memories",
+            "forget-memory",
+            "forget",
+            "edit-memory",
+            "update-memory",
+            "export-memory",
+            "sync-directory",
+            "index-status",
+            "index-list",
+            "index-delete",
+            "index-expire",
+            "index-duplicates",
+            "doctor",
+            "update",
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "argv", ["cligpt.py", command, "--help"]):
+                    with contextlib.redirect_stdout(stdout):
+                        with self.assertRaises(SystemExit):
+                            cli_interface.parse_args()
+
+                help_text = stdout.getvalue()
+                self.assertNotIn("+debug", help_text)
+                self.assertNotIn("--file", help_text)
+                self.assertNotIn("--image", help_text)
+                self.assertNotIn("--blob", help_text)
+                self.assertNotIn("--raw", help_text)
+                self.assertNotIn("--prompt-cache", help_text)
+                if command not in {"sync-directory"}:
+                    self.assertNotIn("--index-concurrency", help_text)
+
+    def test_update_and_sync_help_keep_command_specific_options(self):
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", ["cligpt.py", "update", "--help"]):
+            with contextlib.redirect_stdout(stdout):
+                with self.assertRaises(SystemExit):
+                    cli_interface.parse_args()
+
+        update_help = stdout.getvalue()
+        self.assertIn("Update the local cligpt checkout", update_help)
+        self.assertIn("asks before installing AUR packages", update_help)
+        self.assertIn("--system", update_help)
+        self.assertIn("--skip-git", update_help)
+        self.assertIn("--skip-pip", update_help)
+        self.assertIn("--dry-run", update_help)
+
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", ["cligpt.py", "sync-directory", "--help"]):
+            with contextlib.redirect_stdout(stdout):
+                with self.assertRaises(SystemExit):
+                    cli_interface.parse_args()
+
+        sync_help = stdout.getvalue()
+        self.assertIn("--index-concurrency", sync_help)
+
 
 if __name__ == "__main__":
     unittest.main()
