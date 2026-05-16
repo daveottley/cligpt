@@ -1,4 +1,6 @@
 import sys
+import io
+import contextlib
 import unittest
 from unittest import mock
 
@@ -65,6 +67,42 @@ class CliInterfaceTests(unittest.TestCase):
         self.assertTrue(args.full_context)
         self.assertFalse(args.web_search)
         self.assertEqual(args.prompt, "Use full context.")
+
+    def test_remember_help_omits_query_only_flags(self):
+        argv = [
+            "cligpt.py",
+            "--width",
+            "79",
+            "remember",
+            "--help",
+        ]
+        stdout = io.StringIO()
+
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stdout(stdout):
+                with self.assertRaises(SystemExit):
+                    cli_interface.parse_args()
+
+        help_text = stdout.getvalue()
+        self.assertIn("remember [-h] text", help_text)
+        self.assertIn("Memory in 'key: value' format", help_text)
+        self.assertNotIn("--directory", help_text)
+        self.assertNotIn("--file", help_text)
+        self.assertNotIn("--raw", help_text)
+
+    def test_memory_aliases_parse(self):
+        with mock.patch.object(sys, "argv", ["cligpt.py", "forget", "3"]):
+            args = cli_interface.parse_args()
+
+        self.assertEqual(args.command, "forget")
+        self.assertEqual(args.id, 3)
+
+        with mock.patch.object(sys, "argv", ["cligpt.py", "edit-memory", "3", "name: David"]):
+            args = cli_interface.parse_args()
+
+        self.assertEqual(args.command, "edit-memory")
+        self.assertEqual(args.id, 3)
+        self.assertEqual(args.text, "name: David")
 
 
 if __name__ == "__main__":

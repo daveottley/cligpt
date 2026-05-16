@@ -101,8 +101,8 @@ def save_permanent_memories(memories):
     with open(PERMANENT_MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(memories, f, indent=2)
 
-def add_permanent_memory(memory_data):
-    # If a string is passed, require a colon-separated key-value pair.
+def coerce_memory_data(memory_data):
+    """Normalize a memory string or mapping into stored memory fields."""
     if isinstance(memory_data, str):
         if ':' not in memory_data:
             raise ValueError("Permanent memory must be provided in 'key: value' format.\n"
@@ -112,10 +112,18 @@ def add_permanent_memory(memory_data):
         key = key.strip()
         value = value.strip()
         memory_data = {key: value}
+    return memory_data
+
+def next_permanent_memory_id(memories):
+    ids = [mem.get("id", 0) for mem in memories if isinstance(mem.get("id"), int)]
+    return max(ids, default=0) + 1
+
+def add_permanent_memory(memory_data):
+    memory_data = coerce_memory_data(memory_data)
     
     memories = load_permanent_memories()
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    entry = {"id": len(memories) + 1, "timestamp": timestamp}
+    entry = {"id": next_permanent_memory_id(memories), "timestamp": timestamp}
     entry.update(memory_data)
     memories.append(entry)
     save_permanent_memories(memories)
@@ -147,11 +155,25 @@ def forget_permanent_memory(entry_id):
     """Remove a permanent memory entry by its id."""
     memories = load_permanent_memories()
     new_memories = [mem for mem in memories if mem["id"] != entry_id]
-    # Reassign IDs sequentially
-    for idx, mem in enumerate(new_memories, start=1):
-        mem["id"] = idx
+    if len(new_memories) == len(memories):
+        raise ValueError(f"Permanent memory with id {entry_id} was not found.")
     save_permanent_memories(new_memories)
     return new_memories
+
+def update_permanent_memory(entry_id, memory_data):
+    """Replace a permanent memory entry's stored fields by id."""
+    memory_data = coerce_memory_data(memory_data)
+    memories = load_permanent_memories()
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for mem in memories:
+        if mem["id"] == entry_id:
+            preserved = {"id": mem["id"], "timestamp": timestamp}
+            preserved.update(memory_data)
+            mem.clear()
+            mem.update(preserved)
+            save_permanent_memories(memories)
+            return mem
+    raise ValueError(f"Permanent memory with id {entry_id} was not found.")
 
 def export_permanent_memory(output_file):
     """Export permanent memories to the specified file in JSON format."""

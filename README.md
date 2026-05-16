@@ -107,6 +107,46 @@ You invoke the helper by typing
   • python3 cligpt.py --blob ./firmware.bin "Identify what this blob may contain"
   • python3 cligpt.py --directory ./evidence "Analyze these files"
 
+### Permanent Memory
+
+Permanent memories are stored locally in `permanent_memory.json` and are sent as
+context on normal queries. Use `--no-context` when you do not want recent
+history or permanent memories included in a request.
+
+Save memories in `key: value` format:
+
+```bash
+gpt remember "name: Dave"
+gpt remember "editor: nvim"
+```
+
+List memories and note their stable IDs:
+
+```bash
+gpt view-memory
+gpt memories
+```
+
+Replace a memory by ID:
+
+```bash
+gpt edit-memory 3 "editor: helix"
+gpt update-memory 3 "editor: helix"
+```
+
+Delete a memory by ID:
+
+```bash
+gpt forget 3
+gpt forget-memory 3
+```
+
+Memory IDs are stable. Deleting memory `3` does not renumber the remaining
+memories, and the next new memory receives a new ID.
+
+In interactive mode, use `--remember <key:value>`, `:view-memory`,
+`:edit-memory <id> <key:value>`, and `:forget-memory <id>`.
+
 ### Model
 
 You can use a specific model by using the following flag:

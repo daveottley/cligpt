@@ -8,6 +8,43 @@ import memory_manager
 
 
 class MemoryManagerTests(unittest.TestCase):
+    def test_permanent_memory_ids_are_stable_after_forget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            permanent_path = os.path.join(directory, "permanent_memory.json")
+            with mock.patch.object(memory_manager, "PERMANENT_MEMORY_FILE", permanent_path):
+                first = memory_manager.add_permanent_memory("name: Dave")
+                second = memory_manager.add_permanent_memory("city: Chicago")
+
+                memory_manager.forget_permanent_memory(first["id"])
+                third = memory_manager.add_permanent_memory("editor: nvim")
+                memories = memory_manager.load_permanent_memories()
+
+        self.assertEqual(first["id"], 1)
+        self.assertEqual(second["id"], 2)
+        self.assertEqual(third["id"], 3)
+        self.assertEqual([memory["id"] for memory in memories], [2, 3])
+
+    def test_update_permanent_memory_replaces_entry_without_changing_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            permanent_path = os.path.join(directory, "permanent_memory.json")
+            with mock.patch.object(memory_manager, "PERMANENT_MEMORY_FILE", permanent_path):
+                entry = memory_manager.add_permanent_memory("name: Dave")
+                updated = memory_manager.update_permanent_memory(entry["id"], "name: David")
+                memories = memory_manager.load_permanent_memories()
+
+        self.assertEqual(updated["id"], entry["id"])
+        self.assertEqual(updated["name"], "David")
+        self.assertEqual(memories[0]["id"], entry["id"])
+        self.assertEqual(memories[0]["name"], "David")
+
+    def test_forget_missing_memory_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            permanent_path = os.path.join(directory, "permanent_memory.json")
+            with mock.patch.object(memory_manager, "PERMANENT_MEMORY_FILE", permanent_path):
+                memory_manager.add_permanent_memory("name: Dave")
+                with self.assertRaises(ValueError):
+                    memory_manager.forget_permanent_memory(99)
+
     def test_context_block_to_conversation_text_strips_display_metadata(self):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         block = (

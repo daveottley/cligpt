@@ -19,6 +19,7 @@ from memory_manager import (
         add_permanent_memory, 
         view_permanent_memory, 
         forget_permanent_memory, 
+        update_permanent_memory,
         export_permanent_memory,
 )
 from maintenance import doctor, update
@@ -152,10 +153,11 @@ def interactive_mode(
     print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width, current_web_search))
     print("Entering interactive mode. Type 'exit' or 'quit' to leave.")
     print("You may use special commands in chat:")
-    print("  --remember <text>    : Permanently save the given text")
-    print("  :view-memory         : Display all permanent memories")
-    print("  :forget-memory <id>  : Remove a permanent memory by its ID")
-    print("  :export-memory <file>: Export permanent memories to the specified file")
+    print("  --remember <key:value>   : Permanently save a memory")
+    print("  :view-memory            : Display all permanent memories")
+    print("  :forget-memory <id>     : Remove a permanent memory by its stable ID")
+    print("  :edit-memory <id> <text>: Replace a permanent memory with key:value text")
+    print("  :export-memory <file>   : Export permanent memories to the specified file")
     print("You can adjust flags on the fly by prepending your input with them.")
     print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --context, --no-context, --full-context, --raw, --width <num>, --style <plain|codex|compact>, --no-color, --file <file>, --image <image>, --blob <file>, --directory <dir>, --remote-search, --index-concurrency <num>, --allow-partial-index, --wait-index, --prompt-cache-key <key>, --prompt-cache-retention <auto|in_memory|24h|off>")
     print("If only flags are provided, a confirmation message is printed.")
@@ -176,7 +178,8 @@ def interactive_mode(
                 print("  exit, quit             : Exit interactive mode")
                 print("  --remember <key:value> : Save a semantically indexed long-term memory")
                 print("  :view-memory           : Display all long-term memories")
-                print("  :forget-memory <id>    : Remove a long-term memory by its ID")
+                print("  :forget-memory <id>    : Remove a long-term memory by its stable ID")
+                print("  :edit-memory <id> <key:value> : Replace a long-term memory by stable ID")
                 print("  :export-memory <file>  : Export long-term memories to a file")
                 print("  Flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --context, --no-context, --full-context, --raw, --width <num>, --style <plain|codex|compact>, --no-color")
                 print("  Stream safety: --heartbeat-seconds <num>, --idle-timeout <num>, --request-timeout <num>")
@@ -219,15 +222,35 @@ def interactive_mode(
                 continue
             elif user_input.startswith(":forget-memory"):
                 parts = user_input.split()
-                if len(parts) < 2:
+                if len(parts) != 2:
                     print("Usage: :forget-memory <id>")
                     continue
                 try:
                     entry_id = int(parts[1])
-                    forget_permanent_memory(entry_id)
-                    print(f"Permanent memory with id {entry_id} has been removed.")
                 except ValueError:
                     print("Invalid ID. Must be an integer.")
+                    continue
+                try:
+                    forget_permanent_memory(entry_id)
+                    print(f"Permanent memory with id {entry_id} has been removed.")
+                except ValueError as e:
+                    print(e)
+                continue
+            elif user_input.startswith(":edit-memory"):
+                parts = user_input.split(maxsplit=2)
+                if len(parts) != 3:
+                    print("Usage: :edit-memory <id> <key:value>")
+                    continue
+                try:
+                    entry_id = int(parts[1])
+                except ValueError:
+                    print("Invalid ID. Must be an integer.")
+                    continue
+                try:
+                    entry = update_permanent_memory(entry_id, parts[2].strip())
+                    print(f"Updated permanent memory [{entry['id']}] at {entry['timestamp']}.")
+                except ValueError as e:
+                    print(e)
                 continue
             elif user_input.startswith(":export-memory"):
                 parts = user_input.split()
@@ -446,7 +469,8 @@ def interactive_mode(
 def parse_args():
     argv = sys.argv[1:]
     subcmds = {
-        "query", "remember", "view-memory", "forget-memory", "export-memory",
+        "query", "remember", "view-memory", "memories", "forget-memory", "forget",
+        "edit-memory", "update-memory", "export-memory",
         "sync-directory", "index-status", "index-list", "index-delete",
         "index-expire", "index-duplicates", "doctor", "update",
     }
@@ -554,19 +578,56 @@ def parse_args():
     parser_query.add_argument("-m", "--model", dest="model", default=MODEL,
                               help="Select model to use")
     
-    parser_remember = subparsers.add_parser("remember", parents=[global_parser],
-                                            help="Save text permanently", prefix_chars='-+')
-    parser_remember.add_argument("text", type=str, help="Text to be remembered")
+    parser_remember = subparsers.add_parser(
+        "remember",
+        help="Save a permanent memory",
+        description=(
+            "Save a permanent memory. Use 'key: value' format, for example: "
+            "gpt remember 'name: Dave'"
+        ),
+        prefix_chars='-+',
+    )
+    parser_remember.add_argument("text", type=str, help="Memory in 'key: value' format")
     
-    parser_view = subparsers.add_parser("view-memory", parents=[global_parser],
-                                        help="View permanent memories", prefix_chars='-+')
+    for command_name in ("view-memory", "memories"):
+        subparsers.add_parser(
+            command_name,
+            help="View permanent memories",
+            description="List permanent memories with their stable IDs.",
+            prefix_chars='-+',
+        )
     
-    parser_forget = subparsers.add_parser("forget-memory", parents=[global_parser],
-                                          help="Forget a permanent memory by its id", prefix_chars='-+')
-    parser_forget.add_argument("id", type=int, help="ID of the permanent memory to forget")
+    for command_name in ("forget-memory", "forget"):
+        parser_forget = subparsers.add_parser(
+            command_name,
+            help="Forget a permanent memory by its stable ID",
+            description=(
+                "Delete one permanent memory by ID. Run 'gpt view-memory' first "
+                "to find the ID."
+            ),
+            prefix_chars='-+',
+        )
+        parser_forget.add_argument("id", type=int, help="Stable ID of the permanent memory to forget")
+
+    for command_name in ("edit-memory", "update-memory"):
+        parser_edit = subparsers.add_parser(
+            command_name,
+            help="Replace a permanent memory by its stable ID",
+            description=(
+                "Replace one permanent memory by ID. Run 'gpt view-memory' first "
+                "to find the ID, then pass the corrected memory in 'key: value' format."
+            ),
+            prefix_chars='-+',
+        )
+        parser_edit.add_argument("id", type=int, help="Stable ID of the permanent memory to update")
+        parser_edit.add_argument("text", type=str, help="Replacement memory in 'key: value' format")
     
-    parser_export = subparsers.add_parser("export-memory", parents=[global_parser],
-                                          help="Export permanent memories to a file", prefix_chars='-+')
+    parser_export = subparsers.add_parser(
+        "export-memory",
+        help="Export permanent memories to a file",
+        description="Write permanent memories to a JSON file.",
+        prefix_chars='-+',
+    )
     parser_export.add_argument("output", type=str, help="Output file path")
 
     parser_sync = subparsers.add_parser("sync-directory", parents=[global_parser],
@@ -720,16 +781,25 @@ def main():
             print(f"Added permanent memory [{entry['id']}] at {entry['timestamp']}.")
         except ValueError as e:
             print(e)
-    elif args.command == "view-memory":
+    elif args.command in {"view-memory", "memories"}:
         memories = view_permanent_memory()
         if memories:
             for mem in memories:
                 print(mem)
         else:
             print("No permanent memories found.")
-    elif args.command == "forget-memory":
-        forget_permanent_memory(args.id)
-        print(f"Permanent memory with id {args.id} has been removed.")
+    elif args.command in {"forget-memory", "forget"}:
+        try:
+            forget_permanent_memory(args.id)
+            print(f"Permanent memory with id {args.id} has been removed.")
+        except ValueError as e:
+            print(e)
+    elif args.command in {"edit-memory", "update-memory"}:
+        try:
+            entry = update_permanent_memory(args.id, args.text)
+            print(f"Updated permanent memory [{entry['id']}] at {entry['timestamp']}.")
+        except ValueError as e:
+            print(e)
     elif args.command == "export-memory":
         export_permanent_memory(args.output)
         print(f"Permanent memories exported to {args.output}.")
