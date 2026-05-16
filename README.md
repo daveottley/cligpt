@@ -98,7 +98,8 @@ You invoke the helper by typing
   • python3 cligpt.py --low "Why is the sky blue?"
   • python3 cligpt.py +debug "Why aren't you returning an answer?"
   • python3 cligpt.py --width 100 "Explain UNIX pipes"
-  • python3 cligpt.py --no-web "Explain POSIX pipes from model knowledge only"
+  • python3 cligpt.py --no-context --no-web "Explain POSIX pipes from model knowledge only"
+  • python3 cligpt.py --raw "What is the smallest request?"
   • python3 cligpt.py --file ./paper.pdf "Summarize this document"
   • python3 cligpt.py --file ./draft.docx "Summarize this document"
   • python3 cligpt.py --file ./main.cpp "Review this source file"
@@ -139,6 +140,54 @@ use search for current, fast-changing, or source-sensitive facts. If search is
 used, cligpt asks the model to make source URLs visible in the answer and prints
 only final-answer citations after the streamed response.
 
+### Prompt Cache
+
+OpenAI prompt caching is automatic for supported models. cligpt optimizes for
+cache hits by placing reusable directory/search context before the current user
+question, sending a stable `prompt_cache_key`, and using extended cache
+retention for GPT-5-family models by default. It also keeps volatile machine
+diagnostics such as `neofetch` out of the default system prompt and inserts a
+stable cache anchor before changing context history, because OpenAI cache hits
+require an exact prefix match of at least 1,024 tokens.
+
+The default prompt includes only a compact stable environment block:
+
+```text
+# ENV
+- os: CachyOS Linux 6.x
+- shell: zsh
+- editor: nvim
+- package_manager: pacman
+- aur_helper: paru
+```
+
+When machine-specific detail is actually needed, the model can call the
+read-only local `get_system_profile` function tool instead of receiving raw
+`neofetch` output in every prompt.
+
+Use these flags when you want explicit control:
+
+```text
+--prompt-cache-key KEY                 Override the stable routing key
+--prompt-cache-retention auto          Default; use 24h for GPT-5-family models
+--prompt-cache-retention in_memory     Use normal short-lived cache retention
+--prompt-cache-retention 24h           Request extended cache retention
+--prompt-cache-retention off           Omit prompt_cache_retention
+```
+
+Environment defaults:
+
+```text
+CLIGPT_PROMPT_CACHE_KEY=...
+CLIGPT_PROMPT_CACHE_RETENTION=auto
+CLIGPT_PROMPT_CACHE_MIN_STABLE_WORDS=1152
+CLIGPT_INCLUDE_NEOFETCH=0
+```
+
+The usage footer reports `cached_input`, `cache_hit`, `prompt_cache_key`, and
+`prompt_cache_retention` so repeated long-context requests can be checked
+directly. Official docs: https://platform.openai.com/docs/guides/prompt-caching/prompt-caching
+
 OpenAI may also return broader web-search source metadata that was not cited in
 the final answer. cligpt logs those uncited sources to a per-response file under
 `sources/`, keyed by the same response ID stored in `context.txt`, and prints an
@@ -147,14 +196,23 @@ source list.
 
 Disable web search for a request with:
   --no-web          Use model knowledge and local context only
+  --no-context      Do not send recent context.txt history or permanent memories
+  --full-context    Send selected context.txt blocks with usage stats and sources
+  --raw             Send only the typed prompt, with no system/context/tools/web/files
 
 Examples:
   • python3 cligpt.py "What changed in Python 3.14?"
-  • python3 cligpt.py --no-web "Explain how a pipe works in Unix"
+  • python3 cligpt.py --no-context --no-web "Explain how a pipe works in Unix"
+  • python3 cligpt.py --raw "What is the meaning of life?"
 
-In interactive mode, web search starts enabled. Prefix a message with `--no-web`
-to disable it for that message and following messages. Prefix a later message
-with `--web` to turn it back on.
+In interactive mode, web search and context history start enabled. Prefix a
+message with `--no-web` to disable web search for that message and following
+messages. Prefix a later message with `--web` to turn it back on. Use
+`--no-context` to turn recent-history/permanent-memory context off, and
+`--context` to re-enable it. Use `--full-context` when the model should see
+usage stats, source footers, and other metadata from selected context blocks.
+For minimum-token experiments, use `--raw`; it sends only the typed prompt and
+cannot be combined with files or directories.
 
 ### File and Image Uploads
 
@@ -281,12 +339,17 @@ OpenAI's current input docs:
 ### Model Context
 
 cligpt uses model capability profiles to advertise and enforce basic limits. The
-default GPT-5-family profile is configured with a 400,000 token context window, a
-100,000 token output cap for cligpt, and a conservative 250,000 token safe input
-budget. Large directories should use `--directory`, which locally selects
-relevant file chunks before the request instead of forcing every document into
-the prompt context. Use `--remote-search` when local snippets are not enough and
-you want OpenAI file_search to retrieve from a remote vector store.
+profiles are refreshed from OpenAI's model comparison documentation and cached
+for 3 days in `.cligpt/openai_model_limits.json`; checked-in fallback values are
+used if the docs cannot be reached. The recent-history budget is derived from
+the selected model's safe input budget, not from the output-token cap. cligpt
+uses 20% of safe input for recent conversation history, with a 4,000-token floor
+and 120,000-token ceiling.
+
+Large directories should use `--directory`, which locally selects relevant file
+chunks before the request instead of forcing every document into the prompt
+context. Use `--remote-search` when local snippets are not enough and you want
+OpenAI file_search to retrieve from a remote vector store.
 
 As a rough guide, direct file attachment is best for a few files. A directory of
 hundreds of leases, scans, spreadsheets, or photos should be indexed and searched.
@@ -346,18 +409,33 @@ is silent, so a heavy directory/file-search request does not look dead:
 --request-timeout N     OpenAI request timeout in seconds, default 3600
 ```
 
-With `+debug`, stream lifecycle events are logged to stderr, including when the
-stream opens, tool/search events arrive, first visible text appears, and the
-response completes or fails. Ctrl-C aborts the local wait cleanly and does not
-roll back the reusable directory index.
+With `+debug`, cligpt prints a request-input estimate that breaks down the
+assembled payload. Stream event counts are reported later in `Usage Detail`
+instead of being printed live, so text delta events do not flood the terminal.
+Ctrl-C aborts the local wait cleanly and does not roll back the reusable
+directory index.
 
-Every response prints a compact usage footer and appends it to `context.txt`:
+Every response renders a compact Markdown usage section at the bottom of the
+same assistant panel and stores the full visible answer, including usage and
+source footers, in `context.txt`. When cligpt later reuses recent history as
+model input, it strips that stored log down to conversation text only, so usage
+and source metadata remain on disk without being resent as prompt context:
 
 ```text
-[Usage: input:12,345 output:1,234 reasoning:567 total:13,579 | file_search:1 call(s), 50 result(s) | web_search:0 call(s) | direct_uploads:0 file(s), 0 B | directory:reused 212, uploaded 0, failed 0, pruned 0, remote_adopted 1, background_syncs 0 | local_search:reused 300, indexed 2, failed 0, selected 18]
+### Token Usage
+
+`usage_cost` input:12,345; output:1,234; reasoning:567; total:13,579; estimated_cost:$0.0967  
+`prompt_cache` cached_input:1,000; cache_hit:8.1%; prompt_cache_key:cligp...def456; prompt_cache_retention:24h  
+`file_search_direct_uploads` file_search:1 call(s), 50 result(s); web_search:0 call(s); direct_uploads:0 file(s), 0 B; local_tools:get_system_profile:1 call(s)  
+`directory` reused:212; uploaded:0; failed:0; pruned:0; remote_adopted:1; background_syncs:0  
+`local_search` reused:300; indexed:2; failed:0; selected:18
 ```
 
-This is API-reported token usage plus local search and sync/upload counters. It
-is useful for spotting accidental re-uploads, duplicate vector-store creation, or
-over-broad local retrieval, but it is not a perfect real-time billing statement
-because storage charges and dashboard aggregation can lag.
+This is API-reported token usage plus an estimated per-response cost, tool
+calls, local search counters, and sync/upload counters. Cached input is shown
+when the API reports `usage.input_tokens_details.cached_tokens`. Reasoning
+tokens are included in output-token billing when reported. The estimate includes
+known model token rates plus per-call file_search and web_search rates where
+available; it does not include recurring vector-store storage charges, and it is
+not a perfect real-time billing statement because storage charges and dashboard
+aggregation can lag.

@@ -110,14 +110,19 @@ class TerminalRenderer:
         self.tool("diff", diff_text, "diff")
 
     def render_stream(self, chunks: Iterable[str]) -> str:
+        return self.render_stream_with_final(chunks)
+
+    def render_stream_with_final(self, chunks: Iterable[str], final_builder=None) -> str:
         if not self.enabled:
             text = []
             for chunk in chunks:
                 text.append(chunk)
                 print(chunk, end="", flush=True)
-            return "".join(text)
+            streamed_text = "".join(text)
+            return final_builder(streamed_text) if final_builder else streamed_text
 
         buffer: list[str] = []
+        final_text = ""
         with Live(
             self._assistant_panel(""),
             console=self.console,
@@ -127,7 +132,11 @@ class TerminalRenderer:
             for chunk in chunks:
                 buffer.append(chunk)
                 live.update(self._assistant_panel("".join(buffer)))
-        return "".join(buffer)
+            streamed_text = "".join(buffer)
+            final_text = final_builder(streamed_text) if final_builder else streamed_text
+            if final_text != streamed_text:
+                live.update(self._assistant_panel(final_text))
+        return final_text
 
     def _markdown(self, text: str):
         return Markdown(text, code_theme=self.config.code_theme)

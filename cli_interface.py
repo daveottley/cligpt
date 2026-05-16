@@ -8,6 +8,8 @@ from config import (
     DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_IDLE_TIMEOUT_SECONDS,
     DEFAULT_OUTPUT_STYLE,
+    DEFAULT_PROMPT_CACHE_KEY,
+    DEFAULT_PROMPT_CACHE_RETENTION,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_VECTOR_STORE_EXPIRATION_DAYS,
 )
@@ -88,7 +90,8 @@ def has_default_query_prompt(argv):
     options_with_values = {
         "--width", "--model", "-m", "--file", "--image", "--directory",
         "--blob", "--index-concurrency", "--style", "--heartbeat-seconds",
-        "--idle-timeout", "--request-timeout",
+        "--idle-timeout", "--request-timeout", "--prompt-cache-key",
+        "--prompt-cache-retention",
     }
     index = 0
     while index < len(argv):
@@ -125,6 +128,10 @@ def interactive_mode(
     initial_heartbeat_seconds=DEFAULT_HEARTBEAT_SECONDS,
     initial_idle_timeout_seconds=DEFAULT_IDLE_TIMEOUT_SECONDS,
     initial_request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    initial_prompt_cache_key=DEFAULT_PROMPT_CACHE_KEY,
+    initial_prompt_cache_retention=DEFAULT_PROMPT_CACHE_RETENTION,
+    initial_include_context=True,
+    initial_full_context=False,
 ):
     # Set initial flag values (default reasoning effort defaults to "medium")
     current_reasoning_effort = initial_reasoning_effort or "medium"
@@ -136,6 +143,10 @@ def interactive_mode(
     current_heartbeat_seconds = initial_heartbeat_seconds
     current_idle_timeout_seconds = initial_idle_timeout_seconds
     current_request_timeout_seconds = initial_request_timeout_seconds
+    current_prompt_cache_key = initial_prompt_cache_key
+    current_prompt_cache_retention = initial_prompt_cache_retention
+    current_include_context = initial_include_context
+    current_full_context = initial_full_context
 
     # Print initial REPL header.
     print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width, current_web_search))
@@ -146,7 +157,7 @@ def interactive_mode(
     print("  :forget-memory <id>  : Remove a permanent memory by its ID")
     print("  :export-memory <file>: Export permanent memories to the specified file")
     print("You can adjust flags on the fly by prepending your input with them.")
-    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --width <num>, --style <plain|codex|compact>, --no-color, --file <file>, --image <image>, --blob <file>, --directory <dir>, --remote-search, --index-concurrency <num>, --allow-partial-index, --wait-index")
+    print("  Recognized flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --context, --no-context, --full-context, --raw, --width <num>, --style <plain|codex|compact>, --no-color, --file <file>, --image <image>, --blob <file>, --directory <dir>, --remote-search, --index-concurrency <num>, --allow-partial-index, --wait-index, --prompt-cache-key <key>, --prompt-cache-retention <auto|in_memory|24h|off>")
     print("If only flags are provided, a confirmation message is printed.")
     
     try:
@@ -167,8 +178,9 @@ def interactive_mode(
                 print("  :view-memory           : Display all long-term memories")
                 print("  :forget-memory <id>    : Remove a long-term memory by its ID")
                 print("  :export-memory <file>  : Export long-term memories to a file")
-                print("  Flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --width <num>, --style <plain|codex|compact>, --no-color")
+                print("  Flags: +debug (+d), -debug (-d), --high (-h), --medium (-m), --low (-l), --web, --no-web, --context, --no-context, --full-context, --raw, --width <num>, --style <plain|codex|compact>, --no-color")
                 print("  Stream safety: --heartbeat-seconds <num>, --idle-timeout <num>, --request-timeout <num>")
+                print("  Prompt cache: --prompt-cache-key <key>, --prompt-cache-retention <auto|in_memory|24h|off>")
                 print("  Uploads: --file <file>, --image <png|jpg|jpeg|webp|gif>, --blob <file>, --directory <dir>")
                 print("  --file accepts PDFs, LibreOffice documents, and raw text/code files.")
                 print("  --blob sends a text report with metadata, hashes, hex preview, and strings.")
@@ -235,7 +247,7 @@ def interactive_mode(
                 continue
             recognized_flags = {"+debug", "+d", "-debug", "-d", "--high", "-high", "-h",
                                "--medium", "-medium", "-m", "--low", "-low", "-l",
-                               "--web", "--no-web", "--remote-search", "--allow-partial-index", "--wait-index",
+                               "--web", "--no-web", "--context", "--no-context", "--full-context", "--raw", "--remote-search", "--allow-partial-index", "--wait-index",
                                "--no-color"}
             flag_tokens = []
             query_tokens = []
@@ -247,6 +259,7 @@ def interactive_mode(
             remote_search = False
             allow_partial_index = False
             wait_index = False
+            raw_prompt = False
             index = 0
             malformed_flag = False
             while index < len(tokens):
@@ -254,7 +267,8 @@ def interactive_mode(
                 if token in {
                     "--width", "--file", "--image", "--blob", "--directory",
                     "--index-concurrency", "--style", "--heartbeat-seconds",
-                    "--idle-timeout", "--request-timeout",
+                    "--idle-timeout", "--request-timeout", "--prompt-cache-key",
+                    "--prompt-cache-retention",
                 }:
                     if index + 1 >= len(tokens):
                         print(f"Usage: {token} <value>")
@@ -291,6 +305,14 @@ def interactive_mode(
                             print(f"{token} must be a positive integer.")
                             malformed_flag = True
                             break
+                    elif token == "--prompt-cache-key":
+                        flag_tokens.append((token, value))
+                    elif token == "--prompt-cache-retention":
+                        if value not in {"auto", "in_memory", "24h", "off"}:
+                            print("Prompt cache retention must be auto, in_memory, 24h, or off.")
+                            malformed_flag = True
+                            break
+                        flag_tokens.append((token, value))
                     elif token == "--file":
                         file_paths.append(value)
                     elif token == "--image":
@@ -331,6 +353,21 @@ def interactive_mode(
                 elif flag == "--no-web":
                     current_web_search = False
                     print("Web search turned OFF.")
+                elif flag == "--context":
+                    current_include_context = True
+                    current_full_context = False
+                    print("Context history turned ON.")
+                elif flag == "--no-context":
+                    current_include_context = False
+                    current_full_context = False
+                    print("Context history turned OFF.")
+                elif flag == "--full-context":
+                    current_include_context = True
+                    current_full_context = True
+                    print("Full context history turned ON.")
+                elif flag == "--raw":
+                    raw_prompt = True
+                    print("Raw prompt mode enabled for this query.")
                 elif flag == "--remote-search":
                     remote_search = True
                     print("Directory queries will use OpenAI file_search vector stores.")
@@ -358,10 +395,18 @@ def interactive_mode(
                 elif flag == "--request-timeout":
                     current_request_timeout_seconds = value
                     print(f"Request timeout set to {current_request_timeout_seconds} seconds.")
+                elif flag == "--prompt-cache-key":
+                    current_prompt_cache_key = value
+                    print(f"Prompt cache key set to {current_prompt_cache_key}.")
+                elif flag == "--prompt-cache-retention":
+                    current_prompt_cache_retention = value
+                    print(f"Prompt cache retention set to {current_prompt_cache_retention}.")
             # If only flags were provided, reprint the header with updated settings.
             if not query_tokens:
                 if file_paths or image_paths or blob_paths or directory_paths:
                     print("Upload flags apply to a query. Add a prompt after the upload paths.")
+                if raw_prompt:
+                    print("Raw prompt mode applies to a query. Add a prompt after --raw.")
                 print(format_mode_header(current_reasoning_effort, current_debug_mode, current_width, current_web_search))
             else:
                 # Otherwise, join query tokens into a query string and process it.
@@ -387,6 +432,11 @@ def interactive_mode(
                         heartbeat_seconds=current_heartbeat_seconds,
                         idle_timeout_seconds=current_idle_timeout_seconds,
                         request_timeout_seconds=current_request_timeout_seconds,
+                        prompt_cache_key=current_prompt_cache_key,
+                        prompt_cache_retention=current_prompt_cache_retention,
+                        include_context=current_include_context,
+                        full_context=current_full_context,
+                        raw_prompt=raw_prompt,
                     )
                 except ValueError as exc:
                     print(exc)
@@ -426,6 +476,18 @@ def parse_args():
     global_parser.add_argument("--no-web", dest="web_search", action="store_false",
                                default=argparse.SUPPRESS,
                                help="Disable default web search for this request")
+    global_parser.add_argument("--context", dest="include_context", action="store_true",
+                               default=True,
+                               help="Send recent sanitized context.txt history and permanent memory context")
+    global_parser.add_argument("--no-context", dest="include_context", action="store_false",
+                               default=argparse.SUPPRESS,
+                               help="Do not send recent context.txt history or permanent memory context")
+    global_parser.add_argument("--full-context", dest="full_context", action="store_true",
+                               default=False,
+                               help="Send selected context.txt blocks with usage stats, sources, and metadata")
+    global_parser.add_argument("--raw", dest="raw_prompt", action="store_true",
+                               default=False,
+                               help="Send only the typed prompt: no system message, context, tools, web search, prompt cache, files, or directories")
     global_parser.add_argument("--file", dest="file_paths", action="append",
                                default=argparse.SUPPRESS, metavar="FILE",
                                help="Upload a PDF, LibreOffice-convertible document, or raw text/code file. Docs: https://platform.openai.com/docs/guides/pdf-files")
@@ -466,6 +528,13 @@ def parse_args():
     global_parser.add_argument("--request-timeout", dest="request_timeout_seconds", type=positive_int,
                                default=argparse.SUPPRESS, metavar="N",
                                help=f"OpenAI request timeout in seconds (default: {DEFAULT_REQUEST_TIMEOUT_SECONDS})")
+    global_parser.add_argument("--prompt-cache-key", dest="prompt_cache_key",
+                               default=argparse.SUPPRESS, metavar="KEY",
+                               help="Override the stable OpenAI prompt_cache_key used to improve prompt cache routing")
+    global_parser.add_argument("--prompt-cache-retention", dest="prompt_cache_retention",
+                               choices=["auto", "in_memory", "24h", "off"],
+                               default=argparse.SUPPRESS,
+                               help=f"Prompt cache retention policy (default: {DEFAULT_PROMPT_CACHE_RETENTION}; auto uses 24h for GPT-5-family models)")
     
     # Create the main parser.
     parser = argparse.ArgumentParser(
@@ -560,6 +629,14 @@ def main():
         args.width = None
     if not hasattr(args, "web_search"):
         args.web_search = True
+    if not hasattr(args, "include_context"):
+        args.include_context = True
+    if not hasattr(args, "full_context"):
+        args.full_context = False
+    if not hasattr(args, "raw_prompt"):
+        args.raw_prompt = False
+    if args.full_context:
+        args.include_context = True
     if not hasattr(args, "file_paths"):
         args.file_paths = []
     if not hasattr(args, "image_paths"):
@@ -586,6 +663,10 @@ def main():
         args.idle_timeout_seconds = DEFAULT_IDLE_TIMEOUT_SECONDS
     if not hasattr(args, "request_timeout_seconds"):
         args.request_timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    if not hasattr(args, "prompt_cache_key"):
+        args.prompt_cache_key = DEFAULT_PROMPT_CACHE_KEY
+    if not hasattr(args, "prompt_cache_retention"):
+        args.prompt_cache_retention = DEFAULT_PROMPT_CACHE_RETENTION
     if not getattr(args, "command", None):
         interactive_mode(
             args.reasoning,
@@ -597,6 +678,10 @@ def main():
             args.heartbeat_seconds,
             args.idle_timeout_seconds,
             args.request_timeout_seconds,
+            args.prompt_cache_key,
+            args.prompt_cache_retention,
+            args.include_context,
+            args.full_context,
         )
     elif args.command == "query":
         try:
@@ -621,6 +706,11 @@ def main():
                 heartbeat_seconds=args.heartbeat_seconds,
                 idle_timeout_seconds=args.idle_timeout_seconds,
                 request_timeout_seconds=args.request_timeout_seconds,
+                prompt_cache_key=args.prompt_cache_key,
+                prompt_cache_retention=args.prompt_cache_retention,
+                include_context=args.include_context,
+                full_context=args.full_context,
+                raw_prompt=args.raw_prompt,
             )
         except ValueError as exc:
             print(exc)

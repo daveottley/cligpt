@@ -37,7 +37,11 @@ Assume conversation continuity unless no context is provided.
 - Avoid giant tables unless the user asks for them or the tabular form is clearly the deliverable.
 - Use friendly, educative, and concise language.
 
-# User Settings
-The user is on {distribution} {operating_system} version {version} and uses {shell} as a shell and {editor} as an editor.
+# ENV
+- os: {env_os}
+- shell: {shell}
+- editor: {editor}
+- package_manager: {package_manager}
+- aur_helper: {aur_helper}
 
 # Pruned Context History

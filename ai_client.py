@@ -16,6 +16,7 @@ import time
 import threading
 import queue
 from collections import Counter
+from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import pathname2url
 from openai import OpenAI
@@ -24,6 +25,7 @@ from config import (
     MODEL,
     FAST_MODEL,
     SYSTEM_MESSAGE_FILE,
+    CONTEXT_FILE,
     SOURCES_DIR,
     MAX_UPLOAD_FILES,
     MAX_DIRECTORY_FILES,
@@ -33,8 +35,12 @@ from config import (
     DEFAULT_INDEX_CONCURRENCY,
     DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_PROMPT_CACHE_KEY,
+    DEFAULT_PROMPT_CACHE_MIN_STABLE_WORDS,
+    DEFAULT_PROMPT_CACHE_RETENTION,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_OUTPUT_STYLE,
+    CLIGPT_INCLUDE_NEOFETCH,
     MAX_DIRECT_PDF_UPLOAD_BYTES,
     MAX_COMPRESSED_PDF_UPLOAD_BYTES,
 )
@@ -43,7 +49,7 @@ from memory_manager import (
         prune_context,
         add_to_context,
 )
-from model_capabilities import get_model_capabilities
+from model_capabilities import get_model_capabilities, get_recent_history_token_budget
 from render import RenderConfig, TerminalRenderer
 from vector_store_manager import VectorStoreManager, root_hash, state_root
 from local_search import LocalSearchIndex, build_local_context
@@ -113,6 +119,15 @@ ARCHIVE_DIRECTORY_MARKERS = {
     "historical",
     "inactive",
 }
+
+FILE_SEARCH_CALL_PRICE_PER_1000 = 2.50
+WEB_SEARCH_CALL_PRICE_PER_1000 = 10.00
+PROMPT_CACHE_ANCHOR_SENTENCE = (
+    "Prompt cache stability anchor: this fixed text is not user content, "
+    "not evidence, and must not be quoted or used to answer. "
+)
+LOCAL_TOOL_GET_SYSTEM_PROFILE = "get_system_profile"
+MAX_LOCAL_TOOL_ROUNDS = 3
 CURRENT_DIRECTORY_MARKERS = {
     "current",
     "active",
@@ -1325,7 +1340,7 @@ def upload_attachments(file_paths=None, image_paths=None, directory_paths=None, 
     return attachments
 
 def build_user_content(user_prompt, uploaded_attachments, vector_contexts=None, local_context=None):
-    content = [{"type": "input_text", "text": user_prompt}]
+    content = []
     if local_context:
         content.append({"type": "input_text", "text": local_context["text"]})
     if vector_contexts:
@@ -1374,6 +1389,10 @@ def build_user_content(user_prompt, uploaded_attachments, vector_contexts=None, 
             })
         else:
             content.append({"type": "input_file", "file_id": attachment["file_id"]})
+    content.append({
+        "type": "input_text",
+        "text": f"CURRENT USER QUESTION:\n{user_prompt}",
+    })
     return content
 
 def format_duration(seconds):
@@ -1385,6 +1404,20 @@ def format_duration(seconds):
     if minutes:
         return f"{minutes}m{second:02d}s"
     return f"{second}s"
+
+def format_stream_event_dots(count):
+    count = max(0, int(count))
+    groups = []
+    while count:
+        group_size = min(5, count)
+        groups.append("." * group_size)
+        count -= group_size
+    return " ".join(groups)
+
+def format_stream_event_debug_line(count):
+    dots = format_stream_event_dots(count)
+    suffix = f" {dots}" if dots else ""
+    return f"[OpenAI Stream Events: {max(0, int(count))}]{suffix}"
 
 def iter_stream_with_heartbeat(
     stream,
@@ -1411,6 +1444,7 @@ def iter_stream_with_heartbeat(
     last_heartbeat_at = started_at
     last_idle_warning_at = started_at
     first_text_seen = False
+    first_text_delay = None
     if debug:
         sys.stderr.write("[OpenAI stream opened; waiting for events]\n")
         sys.stderr.flush()
@@ -1446,31 +1480,16 @@ def iter_stream_with_heartbeat(
             event = payload
             last_event_at = time.monotonic()
             event_type = getattr(event, "type", "")
-            if debug and (
-                event_type in {
-                    "response.output_text.delta",
-                    "response.refusal.delta",
-                    "response.completed",
-                    "response.failed",
-                    "error",
-                    "response.error",
-                }
-                or "file_search" in event_type
-                or "web_search" in event_type
-            ):
-                sys.stderr.write(f"[OpenAI stream event: {event_type}]\n")
-                sys.stderr.flush()
             if not first_text_seen and event_type in {"response.output_text.delta", "response.refusal.delta"}:
                 first_text_seen = True
-                if debug:
-                    sys.stderr.write(
-                        f"[First visible output after {format_duration(last_event_at - started_at)}]\n"
-                    )
-                    sys.stderr.flush()
+                first_text_delay = format_duration(last_event_at - started_at)
             yield event
         elif kind == "error":
             raise payload
         elif kind == "done":
+            if debug and first_text_delay:
+                sys.stderr.write(f"[First visible output after {first_text_delay}]\n")
+                sys.stderr.flush()
             break
 
 def resolve_output_width(width=None):
@@ -1502,10 +1521,398 @@ def extract_response_text(response):
                 chunks.append(text)
     return "".join(chunks)
 
+def estimate_tokens_local(text):
+    """Rough local token estimate for debug output, not billing."""
+    if not text:
+        return 0
+    text = str(text)
+    word_estimate = len(text.split())
+    char_estimate = (len(text) + 3) // 4
+    return max(word_estimate, char_estimate)
+
+def estimate_json_tokens(value):
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        text = str(value)
+    return estimate_tokens_local(text)
+
+def input_content_text(content):
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    chunks = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "input_text":
+            chunks.append(str(item.get("text", "")))
+    return "\n".join(chunks)
+
+def count_non_text_input_items(content):
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        1
+        for item in content
+        if isinstance(item, dict) and item.get("type") != "input_text"
+    )
+
+def request_input_debug_breakdown(
+    request_args,
+    *,
+    system_message,
+    runtime_instructions,
+    pruned_context,
+    user_prompt,
+    local_context=None,
+):
+    instructions = request_args.get("instructions", "")
+    input_items = request_args.get("input", []) or []
+    user_content_text = ""
+    non_text_items = 0
+    if isinstance(input_items, str):
+        user_content_text = input_items
+    else:
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            user_content_text += input_content_text(content)
+            non_text_items += count_non_text_input_items(content)
+
+    tools = request_args.get("tools", []) or []
+    include = request_args.get("include", []) or []
+    reasoning = request_args.get("reasoning") or {}
+    text_format = request_args.get("text") or {}
+    local_text = (local_context or {}).get("text", "")
+    known_instruction_parts = (
+        estimate_tokens_local(system_message)
+        + estimate_tokens_local(runtime_instructions)
+        + estimate_tokens_local(pruned_context)
+    )
+    instruction_total = estimate_tokens_local(instructions)
+    hidden_instruction_overhead = max(instruction_total - known_instruction_parts, 0)
+
+    return {
+        "estimate_method": "max(words, chars/4); approximate, not API tokenizer",
+        "estimated_request_input_tokens": (
+            instruction_total
+            + estimate_tokens_local(user_content_text)
+            + estimate_json_tokens(tools)
+            + estimate_json_tokens(include)
+            + estimate_json_tokens(reasoning)
+            + estimate_json_tokens(text_format)
+        ),
+        "instructions": instruction_total,
+        "system_message": estimate_tokens_local(system_message),
+        "runtime_instructions": estimate_tokens_local(runtime_instructions),
+        "pruned_context": estimate_tokens_local(pruned_context),
+        "prompt_cache_anchor_and_headings": hidden_instruction_overhead,
+        "user_content_text": estimate_tokens_local(user_content_text),
+        "current_user_prompt": estimate_tokens_local(user_prompt),
+        "local_search_text": estimate_tokens_local(local_text),
+        "tools_schema": estimate_json_tokens(tools),
+        "include_selectors": estimate_json_tokens(include),
+        "reasoning_settings": estimate_json_tokens(reasoning),
+        "text_format": estimate_json_tokens(text_format),
+        "non_text_input_items": non_text_items,
+    }
+
+def format_request_input_debug_breakdown(breakdown):
+    return (
+        f"[Request Input Estimate: {breakdown['estimated_request_input_tokens']:,} approx tokens]\n"
+        f"  [Instructions Total: {breakdown['instructions']:,}]\n"
+        f"    [System Message: {breakdown['system_message']:,}]\n"
+        f"    [Runtime Instructions: {breakdown['runtime_instructions']:,}]\n"
+        f"    [Pruned Context: {breakdown['pruned_context']:,}]\n"
+        f"    [Prompt Cache Anchor/Headings: {breakdown['prompt_cache_anchor_and_headings']:,}]\n"
+        f"  [User Content Text: {breakdown['user_content_text']:,}]\n"
+        f"    [Current User Prompt: {breakdown['current_user_prompt']:,}]\n"
+        f"    [Local Search Text: {breakdown['local_search_text']:,}]\n"
+        f"  [Tool Schemas: {breakdown['tools_schema']:,}]\n"
+        f"  [Include Selectors: {breakdown['include_selectors']:,}]\n"
+        f"  [Reasoning Settings: {breakdown['reasoning_settings']:,}]\n"
+        f"  [Text Format: {breakdown['text_format']:,}]\n"
+        f"  [Non-text Input Items: {breakdown['non_text_input_items']}]\n"
+        f"  [Estimate Method: {breakdown['estimate_method']}]\n"
+    )
+
+def read_linux_meminfo():
+    data = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                parts = value.strip().split()
+                if not parts:
+                    continue
+                try:
+                    data[key] = int(parts[0]) * 1024
+                except ValueError:
+                    continue
+    except OSError:
+        return {}
+    return data
+
+def read_linux_cpu_model():
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.lower().startswith("model name") and ":" in line:
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        return ""
+    return ""
+
+def linux_distribution_info():
+    try:
+        import distro
+        return {
+            "name": distro.name() or "",
+            "version": distro.version() or "",
+            "id": distro.id() or "",
+        }
+    except Exception:
+        pass
+
+    data = {}
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if "=" not in line:
+                    continue
+                key, value = line.rstrip("\n").split("=", 1)
+                data[key.lower()] = value.strip().strip('"')
+    except OSError:
+        return {}
+    return {
+        "name": data.get("pretty_name") or data.get("name") or "",
+        "version": data.get("version_id") or "",
+        "id": data.get("id") or "",
+    }
+
+def command_output(command, timeout=2, limit=3000):
+    if not command or not shutil.which(command[0]):
+        return ""
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return ""
+    text = (result.stdout or "").strip()
+    if len(text) > limit:
+        return text[:limit] + "\n...[truncated]"
+    return text
+
+def bytes_to_gib(value):
+    if not value:
+        return None
+    return round(float(value) / (1024 ** 3), 2)
+
+def disk_usage_for(path):
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return None
+    return {
+        "path": path,
+        "total_gib": bytes_to_gib(usage.total),
+        "used_gib": bytes_to_gib(usage.used),
+        "free_gib": bytes_to_gib(usage.free),
+    }
+
+def first_available_command(names, default="unknown"):
+    for name in names:
+        if shutil.which(name):
+            return name
+    return default
+
+def display_profile():
+    monitors = command_output(["xrandr", "--listmonitors"], timeout=2, limit=1500)
+    if monitors:
+        return {"source": "xrandr --listmonitors", "monitors": monitors.splitlines()}
+    return {
+        "source": "environment",
+        "display": os.getenv("DISPLAY") or "",
+        "wayland_display": os.getenv("WAYLAND_DISPLAY") or "",
+    }
+
+def graphics_profile():
+    output = command_output(["lspci"], timeout=2, limit=4000)
+    if not output:
+        return []
+    wanted = ("vga compatible controller", "3d controller", "display controller")
+    return [
+        line
+        for line in output.splitlines()
+        if any(marker in line.lower() for marker in wanted)
+    ][:10]
+
+def executable_map(names):
+    return {name: bool(shutil.which(name)) for name in names}
+
+def get_system_profile():
+    """Return a compact, read-only local system profile for the model."""
+    meminfo = read_linux_meminfo()
+    cwd = os.getcwd()
+    home = os.path.expanduser("~")
+    cpu_model = read_linux_cpu_model() or platform.processor()
+    return {
+        "schema_version": 1,
+        "source": "cligpt local get_system_profile tool",
+        "privacy_note": "Generated locally and sent only because the model called this read-only tool.",
+        "os": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "distribution": linux_distribution_info(),
+        },
+        "runtime": {
+            "cwd": cwd,
+            "home": home,
+            "shell": os.path.basename(os.getenv("SHELL", "")) or "unknown",
+            "editor": os.getenv("EDITOR", "unknown"),
+            "python": platform.python_version(),
+        },
+        "hardware": {
+            "cpu_model": cpu_model,
+            "logical_cpu_count": os.cpu_count(),
+            "memory_total_gib": bytes_to_gib(meminfo.get("MemTotal")),
+            "memory_available_gib": bytes_to_gib(meminfo.get("MemAvailable")),
+            "graphics": graphics_profile(),
+        },
+        "storage": {
+            "cwd": disk_usage_for(cwd),
+            "home": disk_usage_for(home),
+            "root": disk_usage_for("/"),
+        },
+        "display": display_profile(),
+        "tools_available": executable_map([
+            "neofetch",
+            "fastfetch",
+            "git",
+            "rg",
+            "python",
+            "python3",
+            "tesseract",
+            "ocrmypdf",
+            "pdftotext",
+            "pdfinfo",
+            "pdftoppm",
+            "gs",
+            "libreoffice",
+            "soffice",
+            "docker",
+            "podman",
+        ]),
+    }
+
+def local_tool_schemas():
+    return [
+        {
+            "type": "function",
+            "name": LOCAL_TOOL_GET_SYSTEM_PROFILE,
+            "description": (
+                "Return a compact read-only profile of the user's local machine, "
+                "including OS, CPU, memory, storage, display, and selected tool availability. "
+                "Use this only when the answer depends on local machine capabilities or installed tools."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    ]
+
+def collect_local_tool_calls(response):
+    calls = []
+    if not response:
+        return calls
+    for item in response_output_items(response):
+        if get_nested_attr(item, "type") != "function_call":
+            continue
+        name = get_nested_attr(item, "name")
+        if name != LOCAL_TOOL_GET_SYSTEM_PROFILE:
+            continue
+        arguments_text = get_nested_attr(item, "arguments", default="{}") or "{}"
+        try:
+            arguments = json.loads(arguments_text)
+        except json.JSONDecodeError:
+            arguments = {}
+        calls.append({
+            "name": name,
+            "call_id": get_nested_attr(item, "call_id"),
+            "arguments": arguments,
+        })
+    return calls
+
+def execute_local_tool_call(call):
+    name = call.get("name")
+    if name == LOCAL_TOOL_GET_SYSTEM_PROFILE:
+        payload = {"ok": True, "tool": name, "result": get_system_profile()}
+    else:
+        payload = {"ok": False, "tool": name or "unknown", "error": "Unknown local tool."}
+    return {
+        "type": "function_call_output",
+        "call_id": call.get("call_id"),
+        "output": json.dumps(payload, ensure_ascii=True, sort_keys=True),
+    }
+
+def aggregate_completed_responses(responses, fallback_reasoning_tokens=0):
+    responses = [response for response in responses if response]
+    if not responses:
+        return None
+    if len(responses) == 1:
+        return responses[0]
+
+    input_tokens = 0
+    cached_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    reasoning_tokens = 0
+    output_items = []
+    for response in responses:
+        usage = getattr(response, "usage", None)
+        input_tokens += get_nested_attr(usage, "input_tokens", default=0) or 0
+        cached_tokens += get_nested_attr(usage, "input_tokens_details", "cached_tokens", default=0) or 0
+        output_tokens += get_nested_attr(usage, "output_tokens", default=0) or 0
+        total_tokens += get_nested_attr(usage, "total_tokens", default=0) or 0
+        reasoning_tokens += get_nested_attr(usage, "output_tokens_details", "reasoning_tokens", default=0) or 0
+        output_items.extend(response_output_items(response))
+    if not reasoning_tokens:
+        reasoning_tokens = fallback_reasoning_tokens
+    return SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            input_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+            output_tokens=output_tokens,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
+            total_tokens=total_tokens,
+        ),
+        output=output_items,
+    )
+
 def response_usage_dict(response, reasoning_tokens=0):
     usage = getattr(response, "usage", None) if response else None
     return {
         "input_tokens": get_nested_attr(usage, "input_tokens", default=0) or 0,
+        "cached_input_tokens": get_nested_attr(
+            usage,
+            "input_tokens_details",
+            "cached_tokens",
+            default=0,
+        ) or 0,
         "output_tokens": get_nested_attr(usage, "output_tokens", default=0) or 0,
         "total_tokens": get_nested_attr(usage, "total_tokens", default=0) or 0,
         "reasoning_tokens": reasoning_tokens or get_nested_attr(
@@ -1515,6 +1922,136 @@ def response_usage_dict(response, reasoning_tokens=0):
             default=0,
         ) or 0,
     }
+
+def format_cache_hit_ratio(tokens):
+    input_tokens = tokens.get("input_tokens", 0) or 0
+    if input_tokens <= 0:
+        return "0.0%"
+    cached_tokens = tokens.get("cached_input_tokens", 0) or 0
+    return f"{(cached_tokens / input_tokens) * 100:.1f}%"
+
+def estimate_response_cost(tokens, model, file_search_calls=0, web_search_calls=0):
+    capabilities = get_model_capabilities(model)
+    input_rate = capabilities.input_price_per_million
+    cached_input_rate = capabilities.cached_input_price_per_million
+    output_rate = capabilities.output_price_per_million
+    if input_rate is None or output_rate is None:
+        return None
+
+    input_tokens = tokens.get("input_tokens", 0) or 0
+    cached_input_tokens = min(tokens.get("cached_input_tokens", 0) or 0, input_tokens)
+    uncached_input_tokens = max(input_tokens - cached_input_tokens, 0)
+    if cached_input_rate is None:
+        cached_input_rate = input_rate
+
+    input_cost = (uncached_input_tokens * input_rate) / 1_000_000
+    cached_input_cost = (cached_input_tokens * cached_input_rate) / 1_000_000
+    output_cost = ((tokens.get("output_tokens", 0) or 0) * output_rate) / 1_000_000
+    file_search_cost = (file_search_calls * FILE_SEARCH_CALL_PRICE_PER_1000) / 1_000
+    web_search_cost = (web_search_calls * WEB_SEARCH_CALL_PRICE_PER_1000) / 1_000
+    total = input_cost + cached_input_cost + output_cost + file_search_cost + web_search_cost
+    return {
+        "total": total,
+        "currency": "USD",
+        "input": input_cost,
+        "cached_input": cached_input_cost,
+        "output": output_cost,
+        "file_search": file_search_cost,
+        "web_search": web_search_cost,
+        "model": capabilities.model_id,
+        "note": "reasoning tokens are included in billed output tokens when reported",
+    }
+
+def format_estimated_cost(cost):
+    if cost is None:
+        return "unknown"
+    value = cost.get("total", 0) or 0
+    if value >= 1:
+        return f"${value:,.2f}"
+    if value >= 0.01:
+        return f"${value:,.4f}"
+    return f"${value:,.6f}"
+
+def abbreviate_table_value(value, max_chars=14):
+    text = str(value or "none")
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 8:
+        return text[:max_chars]
+    head = (max_chars - 3) // 2
+    tail = max_chars - 3 - head
+    return f"{text[:head]}...{text[-tail:]}"
+
+def normalize_prompt_cache_retention(retention, model):
+    value = (retention or "").strip().lower()
+    if value in {"", "off", "none", "disabled", "false", "0"}:
+        return None
+    if value in {"in_memory", "24h"}:
+        return value
+    if value == "auto":
+        if model.startswith("gpt-5") or model.startswith("gpt-4.1"):
+            return "24h"
+        return None
+    return value
+
+def build_prompt_cache_key(
+    model,
+    system_message,
+    web_search,
+    vector_contexts=None,
+    local_context=None,
+    uploaded_attachments=None,
+    explicit_key=None,
+):
+    explicit_key = (explicit_key or "").strip()
+    if explicit_key:
+        return explicit_key
+    if vector_contexts:
+        file_mode = "file_search"
+    elif local_context:
+        file_mode = "local_search"
+    elif uploaded_attachments:
+        file_mode = "direct"
+    else:
+        file_mode = "none"
+    web_mode = "web" if web_search else "noweb"
+    system_hash = hashlib.sha256(system_message.encode("utf-8")).hexdigest()[:12]
+    return f"cligpt:v2:{model}:{web_mode}:{file_mode}:{system_hash}"
+
+def build_prompt_cache_anchor(current_word_count, target_word_count=DEFAULT_PROMPT_CACHE_MIN_STABLE_WORDS):
+    if target_word_count <= 0 or current_word_count >= target_word_count:
+        return ""
+    words_needed = target_word_count - current_word_count
+    sentence_words = len(PROMPT_CACHE_ANCHOR_SENTENCE.split())
+    repetitions = max(1, (words_needed + sentence_words - 1) // sentence_words)
+    return (PROMPT_CACHE_ANCHOR_SENTENCE * repetitions).strip()
+
+def compose_instructions(
+    system_message,
+    runtime_instructions,
+    pruned_context,
+    min_stable_words=DEFAULT_PROMPT_CACHE_MIN_STABLE_WORDS,
+):
+    context_heading = "# Pruned Context History"
+    stable_system = system_message.rstrip()
+    if stable_system.endswith(context_heading):
+        stable_system = stable_system[:-len(context_heading)].rstrip()
+
+    runtime_block = "# Runtime Request Settings\n" + runtime_instructions.strip()
+    anchor = build_prompt_cache_anchor(
+        len((stable_system + "\n\n" + runtime_block).split()),
+        target_word_count=min_stable_words,
+    )
+    parts = [
+        stable_system,
+        runtime_block,
+    ]
+    if anchor:
+        parts.append("# Prompt Cache Stability Anchor\n" + anchor)
+    parts.append(context_heading)
+    if pruned_context.strip():
+        parts.append(pruned_context.strip())
+    return "\n\n".join(parts)
 
 def count_response_tool_items(response):
     counts = {
@@ -1675,6 +2212,10 @@ def build_usage_summary(
     local_context,
     stream_event_counts,
     background_syncs,
+    local_tool_stats=None,
+    model=MODEL,
+    prompt_cache_key=None,
+    prompt_cache_retention=None,
 ):
     tokens = response_usage_dict(completed_response, reasoning_tokens_used)
     tool_counts = count_response_tool_items(completed_response)
@@ -1684,20 +2225,36 @@ def build_usage_summary(
     # Stream counts are a fallback when the completed response omits tool details.
     file_search_calls = tool_counts["file_search_calls"] or (1 if stream_event_counts.get("file_search", 0) else 0)
     web_search_calls = tool_counts["web_search_calls"] or (1 if stream_event_counts.get("web_search", 0) else 0)
+    cost = estimate_response_cost(tokens, model, file_search_calls, web_search_calls)
+    local_tool_stats = local_tool_stats or {}
+    local_tool_text = ", ".join(
+        f"{name}:{count} call(s)"
+        for name, count in sorted(local_tool_stats.items())
+        if count
+    ) or "none"
     line = (
-        "[Usage: "
-        f"input:{tokens['input_tokens']:,} output:{tokens['output_tokens']:,} "
-        f"reasoning:{tokens['reasoning_tokens']:,} total:{tokens['total_tokens']:,} | "
-        f"file_search:{file_search_calls} call(s), {tool_counts['file_search_results']} result(s) | "
-        f"web_search:{web_search_calls} call(s) | "
-        f"direct_uploads:{direct['files']} file(s), {format_bytes(direct['bytes'])} | "
-        f"directory:reused {directory['reused']}, uploaded {directory['uploaded']}, "
-        f"failed {directory['failed']}, pruned {directory['pruned']}, "
-        f"remote_adopted {directory['remote_adopted']}, background_syncs {len(background_syncs)} | "
-        f"local_search:reused {local_stats.get('reused', 0)}, "
-        f"indexed {local_stats.get('indexed', 0)}, failed {local_stats.get('failed', 0)}, "
-        f"selected {local_stats.get('selected', 0)}"
-        "]"
+        "`usage_cost` "
+        f"input:{tokens['input_tokens']:,}; "
+        f"output:{tokens['output_tokens']:,}; reasoning:{tokens['reasoning_tokens']:,}; "
+        f"total:{tokens['total_tokens']:,}; estimated_cost:{format_estimated_cost(cost)}  \n"
+        "`prompt_cache` "
+        f"cached_input:{tokens['cached_input_tokens']:,}; "
+        f"cache_hit:{format_cache_hit_ratio(tokens)}; "
+        f"prompt_cache_key:{abbreviate_table_value(prompt_cache_key)}; "
+        f"prompt_cache_retention:{prompt_cache_retention or 'default'}  \n"
+        "`file_search_direct_uploads` "
+        f"file_search:{file_search_calls} call(s), "
+        f"{tool_counts['file_search_results']} result(s); web_search:{web_search_calls} call(s); "
+        f"direct_uploads:{direct['files']} file(s), {format_bytes(direct['bytes'])}; "
+        f"local_tools:{local_tool_text}  \n"
+        "`directory` "
+        f"reused:{directory['reused']}; uploaded:{directory['uploaded']}; "
+        f"failed:{directory['failed']}; pruned:{directory['pruned']}; "
+        f"remote_adopted:{directory['remote_adopted']}; background_syncs:{len(background_syncs)}  \n"
+        "`local_search` "
+        f"reused:{local_stats.get('reused', 0)}; "
+        f"indexed:{local_stats.get('indexed', 0)}; failed:{local_stats.get('failed', 0)}; "
+        f"selected:{local_stats.get('selected', 0)}"
     )
     detail = {
         "tokens": tokens,
@@ -1705,10 +2262,27 @@ def build_usage_summary(
             "file_search_calls": file_search_calls,
             "file_search_results": tool_counts["file_search_results"],
             "web_search_calls": web_search_calls,
+            "local_tool_calls": dict(local_tool_stats),
+        },
+        "estimated_cost": cost,
+        "prompt_cache": {
+            "key": prompt_cache_key,
+            "retention": prompt_cache_retention,
+            "cached_input_tokens": tokens["cached_input_tokens"],
+            "cache_hit_ratio": format_cache_hit_ratio(tokens),
         },
         "direct_uploads": direct,
         "directory": directory,
         "local_search": local_stats,
+        "stream_events": {
+            "total": stream_event_counts.get("total", 0),
+            "dots": format_stream_event_dots(stream_event_counts.get("total", 0)),
+            "by_type": {
+                key.removeprefix("type:"): count
+                for key, count in sorted(stream_event_counts.items())
+                if key.startswith("type:")
+            },
+        },
         "background_syncs": background_syncs,
     }
     return line, detail
@@ -1784,7 +2358,10 @@ def source_file_path(response_id):
     return os.path.join(SOURCES_DIR, f"{response_id}.txt")
 
 def source_file_link(response_id):
-    return f"sources/{response_id}.txt"
+    return os.path.abspath(source_file_path(response_id))
+
+def context_file_link():
+    return os.path.abspath(CONTEXT_FILE)
 
 def save_source_block(response_id, block):
     os.makedirs(SOURCES_DIR, exist_ok=True)
@@ -1878,25 +2455,41 @@ def load_system_message():
             distribution = "Linux"
     else:
         distribution = operating_system
+    if operating_system == "Linux":
+        env_os = f"{distribution}, {version}" if version else distribution
+    else:
+        env_os = f"{operating_system} {version}".strip()
     shell_path = os.getenv("SHELL", "")
     shell = os.path.basename(shell_path) if shell_path else "unknown"
     editor = os.getenv("EDITOR", "unknown")
+    package_manager = first_available_command([
+        "pacman",
+        "apt",
+        "dnf",
+        "yum",
+        "zypper",
+        "brew",
+        "nix",
+    ])
+    aur_helper = first_available_command(["paru", "yay"], default="none")
     with open(SYSTEM_MESSAGE_FILE, "r", encoding="utf-8") as f:
         template = f.read().strip()
     
-    # Get neofetch output
-    neofetch_info = get_neofetch_output()
-
-    # Format the system message and append neofetch info.
+    # Keep the default system prefix deterministic so OpenAI prompt caching can match it.
     formatted_message = template.format(
         distribution=distribution,
         operating_system=operating_system,
         version=version,
+        env_os=env_os,
         shell=shell,
-        editor=editor
+        editor=editor,
+        package_manager=package_manager,
+        aur_helper=aur_helper,
     ).strip()
-    
-    return formatted_message + "\n\n" + neofetch_info
+
+    if CLIGPT_INCLUDE_NEOFETCH:
+        return formatted_message + "\n\n" + get_neofetch_output()
+    return formatted_message
 
 def extract_topic_tags(user_prompt, answer_text, model=FAST_MODEL):
     response = client.responses.create(
@@ -1951,6 +2544,11 @@ def single_query(
     heartbeat_seconds=DEFAULT_HEARTBEAT_SECONDS,
     idle_timeout_seconds=DEFAULT_IDLE_TIMEOUT_SECONDS,
     request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    prompt_cache_key=DEFAULT_PROMPT_CACHE_KEY,
+    prompt_cache_retention=DEFAULT_PROMPT_CACHE_RETENTION,
+    include_context=True,
+    full_context=False,
+    raw_prompt=False,
 ):
     """
     Send a query to the AI using the specified reasoning effort.
@@ -1966,6 +2564,17 @@ def single_query(
     capabilities = get_model_capabilities(model)
     if capabilities.reasoning_efforts and reasoning_effort not in capabilities.reasoning_efforts:
         reasoning_effort = capabilities.default_reasoning_effort
+    if raw_prompt:
+        if (
+            normalize_paths(file_paths)
+            or normalize_paths(image_paths)
+            or normalize_paths(blob_paths)
+            or normalize_paths(directory_paths)
+        ):
+            raise ValueError("--raw cannot be combined with --file, --image, --blob, or --directory.")
+        web_search = False
+        include_context = False
+        full_context = False
     response_id = str(uuid.uuid4())
     output_width, width_source = resolve_output_width(width)
     renderer = TerminalRenderer(
@@ -2021,22 +2630,30 @@ def single_query(
     direct_directory_paths = directory_paths if remote_search else None
     uploaded_attachments = upload_attachments(file_paths, image_paths, direct_directory_paths, blob_paths)
 
-    system_message = load_system_message()
-    pruned_context, chat_blocks, topic_tags, oldest_block = prune_context(user_prompt)
+    system_message = "" if raw_prompt else load_system_message()
+    if include_context:
+        pruned_context, chat_blocks, topic_tags, oldest_block = prune_context(
+            user_prompt,
+            model=model,
+            include_metadata=full_context,
+        )
+    else:
+        pruned_context, chat_blocks, topic_tags, oldest_block = "", 0, "disabled", "None"
     
-    def estimate_tokens_local(text):
-        return len(text.split())
     system_tokens = estimate_tokens_local(system_message)
     context_tokens = estimate_tokens_local(pruned_context)
     user_tokens = estimate_tokens_local(user_prompt)
     total_context_tokens = system_tokens + context_tokens + user_tokens
+    recent_history_budget = get_recent_history_token_budget(model)
     attachment_count = len(uploaded_attachments)
     vector_store_count = len(vector_contexts)
     max_output_tokens = min(MAX_OUTPUT_TOKENS, capabilities.max_output_tokens)
 
     # Build header
     web_label = "web:on" if web_search else "web:off"
-    if vector_contexts:
+    if raw_prompt:
+        file_mode = "raw"
+    elif vector_contexts:
         file_mode = "file_search"
     elif local_context:
         file_mode = "local_search"
@@ -2047,13 +2664,17 @@ def single_query(
         f"context:{capabilities.max_context_tokens:,} - safe input:{capabilities.safe_input_tokens:,} - "
         f"max output:{max_output_tokens:,} - width: {output_width} ({width_source})]"
     )
-    debug_header = (f"[Context Tokens: {total_context_tokens}]\n"
-                    f"  [System Message: {system_tokens}]\n"
-                    f"  [Pruned Context: {context_tokens}]\n"
+    debug_header = (f"[Preflight Context Estimate: {total_context_tokens} approx tokens]\n"
+                    f"  [System Message Estimate: {system_tokens}]\n"
+                    f"  [Pruned Context Estimate: {context_tokens}]\n"
+                    f"  [Recent History Budget: {recent_history_budget}]\n"
                     f"    [Chat Blocks: {chat_blocks}]\n"
                     f"    [Topic Tags: {topic_tags}]\n"
                     f"    [Oldest Block: {oldest_block}]\n"
-                    f"  [User Prompt: {user_tokens}]\n"
+                    f"  [User Prompt Estimate: {user_tokens}]\n"
+                    f"  [Raw Prompt Mode: {'enabled' if raw_prompt else 'disabled'}]\n"
+                    f"  [Context History: {'enabled' if include_context else 'disabled'}]\n"
+                    f"  [Full Context Metadata: {'enabled' if include_context and full_context else 'disabled'}]\n"
                     f"  [Web Search: {'enabled' if web_search else 'disabled'}]\n"
                     f"  [Attachments: {attachment_count}]\n"
                     f"  [Vector Stores: {vector_store_count}]\n"
@@ -2062,45 +2683,76 @@ def single_query(
                     f"  [Model Capability Confidence: {capabilities.confidence}]\n"
                     f"  [Output Width: {output_width} ({width_source})]\n")
     
+    runtime_instructions = "" if raw_prompt else (
+        f"Format the visible answer for a terminal with a hard maximum "
+        f"line length of {output_width} characters. Prefer lines as close "
+        f"to {output_width} characters as natural wording allows. Do not "
+        f"use lines longer than {output_width} characters."
+        f"\n\nWeb search is {'enabled' if web_search else 'disabled'} for "
+        f"this request. When web search is enabled, use it for current, "
+        f"fast-changing, or source-sensitive facts. If web search is used, "
+        f"make source URLs visible in the answer."
+        f"\n\nThe selected model has a configured context window of "
+        f"{capabilities.max_context_tokens:,} tokens and a conservative "
+        f"safe input budget of {capabilities.safe_input_tokens:,} tokens. "
+        f"When file_search or local directory search is available, prefer "
+        f"targeted retrieval evidence over assuming entire directories are "
+        f"already loaded into context."
+        f"\n\nA read-only local function tool named {LOCAL_TOOL_GET_SYSTEM_PROFILE} "
+        f"is available. Call it only when the user's task depends on this "
+        f"machine's local OS, hardware, display, storage, package manager, "
+        f"or installed command-line tools. Do not call it for ordinary questions."
+    )
+    combined_system = "" if raw_prompt else compose_instructions(
+        system_message,
+        runtime_instructions,
+        pruned_context,
+        min_stable_words=DEFAULT_PROMPT_CACHE_MIN_STABLE_WORDS if include_context else 0,
+    )
+    effective_prompt_cache_key = None if raw_prompt else build_prompt_cache_key(
+        model,
+        system_message,
+        web_search,
+        vector_contexts=vector_contexts,
+        local_context=local_context,
+        uploaded_attachments=uploaded_attachments,
+        explicit_key=prompt_cache_key,
+    )
+    effective_prompt_cache_retention = None if raw_prompt else normalize_prompt_cache_retention(prompt_cache_retention, model)
+
+    debug_header += (
+        f"  [Prompt Cache Key: {effective_prompt_cache_key}]\n"
+        f"  [Prompt Cache Retention: {effective_prompt_cache_retention or 'default'}]\n"
+    )
+
     if debug:
         renderer.meta(header_basic)
         sys.stdout.write(debug_header)
     else:
         renderer.meta(header_basic)
     sys.stdout.flush()
-        
-    combined_system = (
-        system_message
-        + "\n\n"
-        + pruned_context
-        + "\n\n"
-        + (
-            f"Format the visible answer for a terminal with a hard maximum "
-            f"line length of {output_width} characters. Prefer lines as close "
-            f"to {output_width} characters as natural wording allows. Do not "
-            f"use lines longer than {output_width} characters."
-            f"\n\nWeb search is {'enabled' if web_search else 'disabled'} for "
-            f"this request. When web search is enabled, use it for current, "
-            f"fast-changing, or source-sensitive facts. If web search is used, "
-            f"make source URLs visible in the answer."
-            f"\n\nThe selected model has a configured context window of "
-            f"{capabilities.max_context_tokens:,} tokens and a conservative "
-            f"safe input budget of {capabilities.safe_input_tokens:,} tokens. "
-            f"When file_search or local directory search is available, prefer "
-            f"targeted retrieval evidence over assuming entire directories are "
-            f"already loaded into context."
-        )
-    )
     
-    request_args = {
-        "model": model,
-        "instructions": combined_system,
-        "input": [{"role": "user", "content": build_user_content(user_prompt, uploaded_attachments, vector_contexts, local_context)}],
-        "max_output_tokens": max_output_tokens,
-        "stream": True,
-        "text": {"format": {"type": "text"}},
-        "store": True
-    }
+    if raw_prompt:
+        request_args = {
+            "model": model,
+            "input": user_prompt,
+            "max_output_tokens": max_output_tokens,
+            "stream": True,
+            "store": True,
+        }
+    else:
+        request_args = {
+            "model": model,
+            "instructions": combined_system,
+            "input": [{"role": "user", "content": build_user_content(user_prompt, uploaded_attachments, vector_contexts, local_context)}],
+            "max_output_tokens": max_output_tokens,
+            "stream": True,
+            "text": {"format": {"type": "text"}},
+            "store": True,
+            "prompt_cache_key": effective_prompt_cache_key,
+        }
+    if effective_prompt_cache_retention:
+        request_args["prompt_cache_retention"] = effective_prompt_cache_retention
     tools = []
     include = []
     if web_search:
@@ -2115,13 +2767,27 @@ def single_query(
             "max_num_results": 50,
         })
         include.append("file_search_call.results")
+    if not raw_prompt and LOCAL_TOOL_GET_SYSTEM_PROFILE in capabilities.tools:
+        tools.extend(local_tool_schemas())
     if tools:
         request_args["tools"] = tools
         request_args["tool_choice"] = "auto"
     if include:
         request_args["include"] = include
-    if capabilities.supports_reasoning_effort(reasoning_effort):
+    if not raw_prompt and capabilities.supports_reasoning_effort(reasoning_effort):
         request_args["reasoning"] = {"effort": reasoning_effort}
+
+    if debug:
+        request_breakdown = request_input_debug_breakdown(
+            request_args,
+            system_message=system_message,
+            runtime_instructions=runtime_instructions,
+            pruned_context=pruned_context,
+            user_prompt=user_prompt,
+            local_context=local_context,
+        )
+        sys.stdout.write(format_request_input_debug_breakdown(request_breakdown))
+        sys.stdout.flush()
 
     stream = client.responses.create(**request_args, timeout=request_timeout_seconds)
 
@@ -2139,15 +2805,21 @@ def single_query(
             sys.stdout.write("\n")
     sys.stdout.flush()
 
-    def visible_text_chunks():
+    completed_responses = []
+    local_tool_stats = Counter()
+
+    def stream_visible_response(active_stream):
         nonlocal completed_response, reasoning_tokens_used
         for event in iter_stream_with_heartbeat(
-            stream,
+            active_stream,
             debug=debug,
             heartbeat_seconds=heartbeat_seconds,
             idle_timeout_seconds=idle_timeout_seconds,
         ):
             event_type = getattr(event, "type", "")
+            stream_event_counts["total"] += 1
+            if event_type:
+                stream_event_counts[f"type:{event_type}"] += 1
             if "file_search" in event_type:
                 stream_event_counts["file_search"] += 1
             if "web_search" in event_type:
@@ -2164,7 +2836,8 @@ def single_query(
                     yield content
             elif event_type == "response.completed":
                 completed_response = getattr(event, "response", None)
-                reasoning_tokens_used = (
+                completed_responses.append(completed_response)
+                reasoning_tokens_used += (
                     get_nested_attr(
                         event,
                         "response",
@@ -2179,8 +2852,82 @@ def single_query(
                 error = get_nested_attr(event, "response", "error") or getattr(event, "error", None)
                 raise RuntimeError(f"OpenAI response stream failed: {error}")
 
+    def visible_text_chunks():
+        nonlocal stream, completed_response
+        active_stream = stream
+        for _round in range(MAX_LOCAL_TOOL_ROUNDS + 1):
+            yield from stream_visible_response(active_stream)
+            tool_calls = collect_local_tool_calls(completed_response)
+            if not tool_calls:
+                break
+            if _round >= MAX_LOCAL_TOOL_ROUNDS:
+                raise RuntimeError("Model requested too many local tool rounds.")
+            tool_outputs = []
+            for call in tool_calls:
+                if not call.get("call_id"):
+                    continue
+                local_tool_stats[call["name"]] += 1
+                if debug:
+                    sys.stderr.write(f"[Local tool call: {call['name']}]\n")
+                    sys.stderr.flush()
+                tool_outputs.append(execute_local_tool_call(call))
+            if not tool_outputs:
+                break
+            active_stream = client.responses.create(
+                **{
+                    **request_args,
+                    "input": tool_outputs,
+                    "previous_response_id": get_nested_attr(completed_response, "id"),
+                },
+                timeout=request_timeout_seconds,
+            )
+            stream = active_stream
+
+    usage_detail = None
+
+    def build_final_response(streamed_answer, *, markdown=True):
+        nonlocal completed_response, usage_detail
+        completed_response = aggregate_completed_responses(completed_responses, reasoning_tokens_used)
+
+        sections = []
+        usage_line, usage_detail = build_usage_summary(
+            completed_response,
+            reasoning_tokens_used,
+            uploaded_attachments,
+            vector_contexts,
+            local_context,
+            stream_event_counts,
+            background_syncs,
+            local_tool_stats,
+            model=model,
+            prompt_cache_key=effective_prompt_cache_key,
+            prompt_cache_retention=effective_prompt_cache_retention,
+        )
+        sections.append(("### Token Usage\n\n" if markdown else "Token Usage:\n") + usage_line)
+
+        final_answer = streamed_answer.rstrip()
+        tail = "\n\n".join(sections)
+        if tail:
+            final_answer = final_answer + ("\n\n" if final_answer else "") + tail
+        return final_answer, tail
+
     try:
-        renderer.render_stream(visible_text_chunks())
+        if renderer.enabled:
+            answer_text = renderer.render_stream_with_final(
+                visible_text_chunks(),
+                lambda streamed: build_final_response(streamed, markdown=True)[0],
+            )
+        else:
+            renderer.render_stream(visible_text_chunks())
+            if renderer.style == "plain" or not renderer.enabled:
+                final_text = wrapper.finish()
+                if final_text:
+                    visible_chunks.append(final_text)
+                    sys.stdout.write(final_text)
+            streamed_answer = "".join(visible_chunks)
+            answer_text, tail = build_final_response(streamed_answer, markdown=False)
+            if tail:
+                sys.stdout.write("\n\n" + tail + "\n")
     except KeyboardInterrupt:
         try:
             stream.close()
@@ -2190,19 +2937,21 @@ def single_query(
         sys.stderr.flush()
         raise
 
-    if renderer.style == "plain" or not renderer.enabled:
-        final_text = wrapper.finish()
-        if final_text:
-            visible_chunks.append(final_text)
-            sys.stdout.write(final_text)
+    context_answer_text = "".join(visible_chunks).strip()
+    if not context_answer_text:
+        context_answer_text = answer_text.strip()
 
-    answer_text = "".join(visible_chunks)
+    persisted_answer_text = answer_text.strip()
 
     final_citations = collect_final_answer_citations(completed_response) if completed_response else []
     if final_citations:
+        source_lines = ["Sources:"]
         sys.stdout.write("\n\nSources:\n")
         for index, citation in enumerate(final_citations, start=1):
-            sys.stdout.write(f"[{index}] {citation['title']}: {citation['url']}\n")
+            source_line = f"[{index}] {citation['title']}: {citation['url']}"
+            source_lines.append(source_line)
+            sys.stdout.write(source_line + "\n")
+        persisted_answer_text += "\n\n" + "\n".join(source_lines)
 
     cited_urls = {citation["url"] for citation in final_citations}
     uncited_sources = (
@@ -2212,26 +2961,18 @@ def single_query(
     if log_uncited_web_sources(response_id, user_prompt, uncited_sources):
         note = (
             "\n*Additional web-search sources were returned but not cited in "
-            f"the final answer, logged in your [context]({source_file_link(response_id)}).*"
+            f"the final answer, logged in [source details]({source_file_link(response_id)}). "
+            f"Conversation history is in [context]({context_file_link()}).*"
         )
         sys.stdout.write(note + "\n")
-        answer_text += note
-
-    usage_line, usage_detail = build_usage_summary(
-        completed_response,
-        reasoning_tokens_used,
-        uploaded_attachments,
-        vector_contexts,
-        local_context,
-        stream_event_counts,
-        background_syncs,
-    )
-    sys.stdout.write("\n" + usage_line + "\n")
-    answer_text += "\n" + usage_line
+        persisted_answer_text += note
 
     if debug:
+        total_stream_events = (usage_detail or {}).get("stream_events", {}).get("total", 0)
         sys.stdout.write(
             "\n[Usage Detail]\n"
+            + format_stream_event_debug_line(total_stream_events)
+            + "\n"
             + json.dumps(usage_detail, indent=2, sort_keys=True)
             + "\n"
         )
@@ -2239,11 +2980,14 @@ def single_query(
         sys.stdout.write("\n")
     sys.stdout.flush()
     
-    try:
-        topics = extract_topic_tags(user_prompt, answer_text)
-    except Exception as exc:
-        if debug:
-            sys.stderr.write(f"[Topic tag extraction failed: {exc}]\n")
+    if raw_prompt:
         topics = []
-    add_to_context(user_prompt, answer_text, topics, reasoning_effort, response_id=response_id)
+    else:
+        try:
+            topics = extract_topic_tags(user_prompt, context_answer_text)
+        except Exception as exc:
+            if debug:
+                sys.stderr.write(f"[Topic tag extraction failed: {exc}]\n")
+            topics = []
+    add_to_context(user_prompt, persisted_answer_text, topics, reasoning_effort, response_id=response_id)
     return answer_text

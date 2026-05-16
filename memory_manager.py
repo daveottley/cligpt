@@ -7,7 +7,8 @@ import re
 import json
 import subprocess
 import uuid
-from config import MODEL, CONTEXT_FILE, PERMANENT_MEMORY_FILE, DELIMITER, MAX_CONTEXT_TOKENS
+from config import MODEL, CONTEXT_FILE, PERMANENT_MEMORY_FILE, DELIMITER
+from model_capabilities import get_recent_history_token_budget
 
 REQUIRED_PERMANENT_MEMORIES = ["name", "topics_of_interest"]
 
@@ -30,6 +31,54 @@ def load_context_blocks():
     with open(CONTEXT_FILE, "r", encoding="utf-8") as f:
         content = f.read().strip()
     return content.split(DELIMITER) if content else []
+
+def strip_context_metadata_from_answer(answer_text):
+    """Remove display-only footers before reusing history as model context."""
+    text = answer_text.strip()
+    for marker in ("### Token Usage", "Token Usage:", "Sources:"):
+        if text.startswith(marker):
+            return ""
+        index = text.find("\n" + marker)
+        if index != -1:
+            text = text[:index].rstrip()
+    note_index = text.find("\n*Additional web-search sources were returned")
+    if note_index != -1:
+        text = text[:note_index].rstrip()
+    return text
+
+def context_block_to_conversation_text(block):
+    """
+    Convert a stored context block into the minimal conversation text that should
+    be sent back to the model. context.txt remains a full audit log; this strips
+    timestamps, response IDs, topic tags, usage, sources, and other display-only
+    metadata from the prompt-side copy.
+    """
+    lines = block.strip().splitlines()
+    user_index = None
+    for index, line in enumerate(lines):
+        if line.startswith(">>> "):
+            user_index = index
+            break
+    if user_index is None:
+        return ""
+
+    user_text = lines[user_index][4:].strip()
+    answer_lines = lines[user_index + 1:]
+    if answer_lines and answer_lines[-1].startswith("Topic Tags:"):
+        answer_lines = answer_lines[:-1]
+
+    answer_text = "\n".join(answer_lines).strip()
+    model_prefix = re.match(r"^\[[^\]]+\]\s*(.*)$", answer_text, flags=re.S)
+    if model_prefix:
+        answer_text = model_prefix.group(1).strip()
+    answer_text = strip_context_metadata_from_answer(answer_text)
+
+    parts = []
+    if user_text:
+        parts.append(f"User: {user_text}")
+    if answer_text:
+        parts.append(f"Assistant: {answer_text}")
+    return "\n".join(parts)
 
 def save_context_block(block):
     """Append a block to CONTEXT_FILE."""
@@ -111,12 +160,14 @@ def export_permanent_memory(output_file):
         json.dump(memories, f, indent=2)
     return output_file
 
-def prune_context(user_prompt):
+def prune_context(user_prompt, model=MODEL, token_budget=None, include_metadata=False):
     """
     Assemble context for the AI prompt in prioritized order:
       1. Permanent memories (always included)
       2. Recent context blocks (within the last hour)
     Older blocks can be added if there’s remaining token space.
+    By default, recent blocks are sanitized to conversation text only. When
+    include_metadata is true, selected raw context.txt blocks are included.
     
     Returns:
       pruned_context (str), count of selected non-permanent blocks,
@@ -140,6 +191,7 @@ def prune_context(user_prompt):
     blocks = load_context_blocks()
     selected_blocks = []
     accumulated_tokens = estimate_tokens(permanent_context)
+    max_context_tokens = token_budget or get_recent_history_token_budget(model)
 
     for block in blocks:
         # Check if block is recent (within last hour)
@@ -153,10 +205,13 @@ def prune_context(user_prompt):
             except Exception:
                 pass
         if is_recent:
-            tokens = estimate_tokens(block)
-            if accumulated_tokens + tokens > MAX_CONTEXT_TOKENS:
+            conversation_block = block.strip() if include_metadata else context_block_to_conversation_text(block)
+            if not conversation_block:
+                continue
+            tokens = estimate_tokens(conversation_block)
+            if accumulated_tokens + tokens > max_context_tokens:
                 break
-            selected_blocks.append(block)
+            selected_blocks.append(conversation_block)
             accumulated_tokens += tokens
 
     # Assemble final context: permanent memories come first.
