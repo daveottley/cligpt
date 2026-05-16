@@ -101,14 +101,39 @@ class CliInterfaceTests(unittest.TestCase):
         help_text = stdout.getvalue()
         self.assertIn("usage: gpt command [args]", help_text)
         self.assertIn("CLI Help Agent with context/memory management, web search, and tool use", help_text)
-        self.assertIn("commands:", help_text)
+        self.assertIn("general commands:", help_text)
+        self.assertIn("memory commands:", help_text)
+        self.assertIn("file/directory commands:", help_text)
         self.assertIn("  query", help_text)
+        self.assertLess(help_text.index("  query"), help_text.index("  doctor"))
+        self.assertLess(help_text.index("  doctor"), help_text.index("  update"))
         self.assertIn("  remember", help_text)
+        self.assertIn("  forget             Alias for forget-memory", help_text)
+        self.assertIn("  update-memory      Alias for edit-memory", help_text)
         self.assertIn('Options vary per command. Run "gpt command --help" for detailed options.', help_text)
         self.assertNotIn("{query,remember", help_text)
         self.assertNotIn("positional arguments:", help_text)
         self.assertNotIn("Available subcommands", help_text)
+        self.assertNotIn("\ncommands:", help_text)
         self.assertNotIn("--directory", help_text)
+        self.assertNotIn("\033[", help_text)
+
+    def test_top_level_help_can_use_ansi_styles(self):
+        stdout = io.StringIO()
+
+        with mock.patch.dict("os.environ", {"CLIGPT_FORCE_COLOR": "1"}, clear=False):
+            with mock.patch.object(sys, "argv", ["cligpt.py", "--help"]):
+                with contextlib.redirect_stdout(stdout):
+                    with self.assertRaises(SystemExit):
+                        cli_interface.parse_args()
+
+        help_text = stdout.getvalue()
+        self.assertIn("\033[1musage:\033[0m gpt \033[32mcommand\033[0m [args]", help_text)
+        self.assertIn("\033[1m\033[36mgeneral commands:\033[0m", help_text)
+        self.assertIn("\033[1m\033[36mmemory commands:\033[0m", help_text)
+        self.assertIn("\033[1m\033[36mfile/directory commands:\033[0m", help_text)
+        self.assertIn("\033[32mquery", help_text)
+        self.assertIn('"\033[33mgpt command --help\033[0m"', help_text)
 
     def test_memory_aliases_parse(self):
         with mock.patch.object(sys, "argv", ["cligpt.py", "forget", "3"]):

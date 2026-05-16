@@ -1,4 +1,5 @@
 import unittest
+import subprocess
 from unittest import mock
 
 import maintenance
@@ -58,6 +59,48 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(commands[0], ["apt-get", "update"])
         self.assertEqual(commands[1], ["apt-get", "install", "-y", "libreoffice", "ocrmypdf"])
 
+    def test_system_install_environment_removes_project_virtualenv(self):
+        path = "/home/daveottley/github/cligpt/.venv/bin:/usr/local/bin:/usr/bin"
+        env = {
+            "PATH": path,
+            "VIRTUAL_ENV": "/home/daveottley/github/cligpt/.venv",
+            "PYTHONPATH": "/tmp/python",
+            "PYTHONHOME": "/tmp/home",
+        }
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            cleaned = maintenance.system_install_environment()
+
+        self.assertNotIn("VIRTUAL_ENV", cleaned)
+        self.assertNotIn("PYTHONPATH", cleaned)
+        self.assertNotIn("PYTHONHOME", cleaned)
+        self.assertNotIn("/home/daveottley/github/cligpt/.venv/bin", cleaned["PATH"].split(":"))
+        self.assertIn("/usr/bin", cleaned["PATH"].split(":"))
+
+    def test_run_checked_uses_clean_environment_for_system_installs(self):
+        with mock.patch.object(maintenance, "system_install_environment", return_value={"PATH": "/usr/bin"}):
+            with mock.patch("subprocess.run") as run:
+                maintenance.run_checked(["paru", "-S", "ocrmypdf"], system_install=True)
+
+        run.assert_called_once_with(
+            ["paru", "-S", "ocrmypdf"],
+            cwd=maintenance.PROJECT_ROOT,
+            check=True,
+            env={"PATH": "/usr/bin"},
+        )
+
+    def test_run_checked_exits_without_traceback_on_command_failure(self):
+        error = subprocess.CalledProcessError(7, ["paru", "-S", "ocrmypdf"])
+
+        with mock.patch("subprocess.run", side_effect=error):
+            with mock.patch("builtins.print") as printed:
+                with self.assertRaises(SystemExit) as raised:
+                    maintenance.run_checked(["paru", "-S", "ocrmypdf"])
+
+        output = "\n".join(" ".join(str(part) for part in call.args) for call in printed.call_args_list)
+        self.assertEqual(raised.exception.code, 7)
+        self.assertIn("Command failed with exit code 7", output)
+
     def test_doctor_reports_missing_system_tools(self):
         with mock.patch.object(maintenance, "package_version", return_value="1.0"):
             with mock.patch.object(maintenance, "command_exists", return_value=False):
@@ -95,8 +138,8 @@ class MaintenanceTests(unittest.TestCase):
     def test_update_system_dry_run_prints_but_does_not_execute(self):
         executed = []
 
-        def fake_run_checked(command, cwd=maintenance.PROJECT_ROOT, dry_run=False):
-            executed.append((command, dry_run))
+        def fake_run_checked(command, cwd=maintenance.PROJECT_ROOT, dry_run=False, system_install=False):
+            executed.append((command, dry_run, system_install))
 
         with mock.patch.object(maintenance, "run_checked", side_effect=fake_run_checked):
             with mock.patch.object(maintenance, "command_exists", return_value=False):
@@ -108,16 +151,16 @@ class MaintenanceTests(unittest.TestCase):
                                     status = maintenance.update(install_system=True, dry_run=True)
 
         self.assertEqual(status, 1)
-        self.assertIn((["git", "pull", "--ff-only"], True), executed)
-        self.assertTrue(any(command[:3] == ["sudo", "pacman", "-S"] and dry_run for command, dry_run in executed))
-        self.assertFalse(any(command[:3] == ["sudo", "pacman", "-S"] and "ocrmypdf" in command for command, _ in executed))
-        self.assertIn((["paru", "-S", "--needed", "ocrmypdf"], True), executed)
+        self.assertIn((["git", "pull", "--ff-only"], True, False), executed)
+        self.assertTrue(any(command[:3] == ["sudo", "pacman", "-S"] and dry_run and system_install for command, dry_run, system_install in executed))
+        self.assertFalse(any(command[:3] == ["sudo", "pacman", "-S"] and "ocrmypdf" in command for command, _, _ in executed))
+        self.assertIn((["paru", "-S", "--needed", "ocrmypdf"], True, True), executed)
 
     def test_update_system_requires_confirmation_before_aur_install(self):
         executed = []
 
-        def fake_run_checked(command, cwd=maintenance.PROJECT_ROOT, dry_run=False):
-            executed.append(command)
+        def fake_run_checked(command, cwd=maintenance.PROJECT_ROOT, dry_run=False, system_install=False):
+            executed.append((command, system_install))
 
         with mock.patch.object(maintenance, "run_checked", side_effect=fake_run_checked):
             with mock.patch.object(maintenance, "command_exists", return_value=False):
@@ -129,14 +172,14 @@ class MaintenanceTests(unittest.TestCase):
                                     with mock.patch("os.path.exists", return_value=False):
                                         maintenance.update(install_system=True)
 
-        self.assertTrue(any(command[:3] == ["sudo", "pacman", "-S"] for command in executed))
-        self.assertNotIn(["paru", "-S", "--needed", "ocrmypdf"], executed)
+        self.assertTrue(any(command[:3] == ["sudo", "pacman", "-S"] and system_install for command, system_install in executed))
+        self.assertNotIn((["paru", "-S", "--needed", "ocrmypdf"], True), executed)
 
     def test_update_system_runs_aur_install_after_confirmation(self):
         executed = []
 
-        def fake_run_checked(command, cwd=maintenance.PROJECT_ROOT, dry_run=False):
-            executed.append(command)
+        def fake_run_checked(command, cwd=maintenance.PROJECT_ROOT, dry_run=False, system_install=False):
+            executed.append((command, system_install))
 
         with mock.patch.object(maintenance, "run_checked", side_effect=fake_run_checked):
             with mock.patch.object(maintenance, "command_exists", return_value=False):
@@ -148,7 +191,7 @@ class MaintenanceTests(unittest.TestCase):
                                     with mock.patch("os.path.exists", return_value=False):
                                         maintenance.update(install_system=True)
 
-        self.assertIn(["paru", "-S", "--needed", "ocrmypdf"], executed)
+        self.assertIn((["paru", "-S", "--needed", "ocrmypdf"], True), executed)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import sys
+import os
 import re
 import subprocess
 import argparse
@@ -88,21 +89,49 @@ def positive_int(value):
     return parsed
 
 class TopLevelHelpParser(argparse.ArgumentParser):
+    ANSI = {
+        "bold": "\033[1m",
+        "cyan": "\033[36m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "dim": "\033[2m",
+        "reset": "\033[0m",
+    }
+
+    def should_color_help(self):
+        if os.getenv("CLIGPT_FORCE_COLOR") is not None:
+            return True
+        if os.getenv("NO_COLOR") is not None:
+            return False
+        return sys.stdout.isatty()
+
+    def style_help(self, text, *styles):
+        if not self.should_color_help():
+            return text
+        return "".join(self.ANSI[style] for style in styles) + text + self.ANSI["reset"]
+
     def format_help(self):
-        command_help = getattr(self, "command_help", [])
+        command_groups = getattr(self, "command_groups", [])
         lines = [
-            "usage: gpt command [args]",
+            f"{self.style_help('usage:', 'bold')} gpt {self.style_help('command', 'green')} [args]",
             "",
-            "CLI Help Agent with context/memory management, web search, and tool use",
-            "",
-            "commands:",
+            self.style_help(
+                "CLI Help Agent with context/memory management, web search, and tool use",
+                "bold",
+            ),
         ]
-        for command, help_text in command_help:
-            lines.append(f"  {command:<18} {help_text}")
+        for heading, command_help in command_groups:
+            lines.extend(["", self.style_help(heading, "bold", "cyan")])
+            for command, help_text in command_help:
+                lines.append(f"  {self.style_help(command.ljust(18), 'green')} {help_text}")
         lines.extend([
             "",
-            "options:",
-            '  Options vary per command. Run "gpt command --help" for detailed options.',
+            self.style_help("options:", "bold", "cyan"),
+            (
+                '  Options vary per command. Run "'
+                f"{self.style_help('gpt command --help', 'yellow')}"
+                '" for detailed options.'
+            ),
             "",
         ])
         return "\n".join(lines)
@@ -594,24 +623,30 @@ def parse_args():
         metavar="command",
         parser_class=argparse.ArgumentParser,
     )
-    parser.command_help = [
-        ("query", "Run a one-off query"),
-        ("remember", "Save a permanent memory"),
-        ("view-memory", "View permanent memories"),
-        ("memories", "View permanent memories"),
-        ("forget-memory", "Forget a permanent memory by its stable ID"),
-        ("forget", "Forget a permanent memory by its stable ID"),
-        ("edit-memory", "Replace a permanent memory by its stable ID"),
-        ("update-memory", "Replace a permanent memory by its stable ID"),
-        ("export-memory", "Export permanent memories to a file"),
-        ("sync-directory", "Synchronize a directory into its reusable file-search index"),
-        ("index-status", "Show local sync status for a directory search index"),
-        ("index-list", "List OpenAI vector stores and storage usage"),
-        ("index-delete", "Delete an OpenAI vector store by id"),
-        ("index-expire", "Set vector store expiration by id"),
-        ("index-duplicates", "List likely duplicate cligpt vector stores"),
-        ("doctor", "Check Python packages, API key, and local document/OCR tools"),
-        ("update", "Update cligpt, Python deps, and optionally system tools"),
+    parser.command_groups = [
+        ("general commands:", [
+            ("query", "Run a one-off query"),
+            ("doctor", "Check Python packages, API key, and local document/OCR tools"),
+            ("update", "Update cligpt, Python deps, and optionally system tools"),
+        ]),
+        ("memory commands:", [
+            ("remember", "Save a permanent memory"),
+            ("view-memory", "View permanent memories"),
+            ("memories", "View permanent memories"),
+            ("forget-memory", "Forget a permanent memory by its stable ID"),
+            ("forget", "Alias for forget-memory"),
+            ("edit-memory", "Replace a permanent memory by its stable ID"),
+            ("update-memory", "Alias for edit-memory"),
+            ("export-memory", "Export permanent memories to a file"),
+        ]),
+        ("file/directory commands:", [
+            ("sync-directory", "Synchronize a directory into its reusable file-search index"),
+            ("index-status", "Show local sync status for a directory search index"),
+            ("index-list", "List OpenAI vector stores and storage usage"),
+            ("index-delete", "Delete an OpenAI vector store by id"),
+            ("index-expire", "Set vector store expiration by id"),
+            ("index-duplicates", "List likely duplicate cligpt vector stores"),
+        ]),
     ]
     
     # Define subcommands.

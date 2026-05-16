@@ -195,6 +195,26 @@ def format_command(command):
     return " ".join(command)
 
 
+def system_install_environment():
+    env = os.environ.copy()
+    venv_path = env.pop("VIRTUAL_ENV", None)
+    for key in ("PYTHONHOME", "PYTHONPATH"):
+        env.pop(key, None)
+
+    remove_paths = {
+        os.path.join(PROJECT_ROOT, ".venv", "bin"),
+    }
+    if venv_path:
+        remove_paths.add(os.path.join(venv_path, "bin"))
+
+    path_parts = [
+        path for path in env.get("PATH", "").split(os.pathsep)
+        if path and os.path.abspath(path) not in {os.path.abspath(item) for item in remove_paths}
+    ]
+    env["PATH"] = os.pathsep.join(path_parts)
+    return env
+
+
 def doctor():
     missing_tools = []
     print("cligpt doctor")
@@ -254,11 +274,16 @@ def doctor():
     return 1 if missing_tools else 0
 
 
-def run_checked(command, *, cwd=PROJECT_ROOT, dry_run=False):
+def run_checked(command, *, cwd=PROJECT_ROOT, dry_run=False, system_install=False):
     print(f"$ {format_command(command)}", flush=True)
     if dry_run:
         return
-    subprocess.run(command, cwd=cwd, check=True)
+    env = system_install_environment() if system_install else None
+    try:
+        subprocess.run(command, cwd=cwd, check=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        print(f"Command failed with exit code {exc.returncode}: {format_command(command)}")
+        raise SystemExit(exc.returncode) from None
 
 
 def confirm_install_command(command):
@@ -295,7 +320,7 @@ def update(skip_git=False, skip_pip=False, install_system=False, dry_run=False):
         notes = install_notes_for_manager(missing_tools, manager)
         if install_system and commands:
             for command in commands:
-                run_checked(command, dry_run=dry_run)
+                run_checked(command, dry_run=dry_run, system_install=True)
         elif commands:
             print()
             print("System tools are missing. Re-run with --system to install them, or run:")
@@ -307,9 +332,9 @@ def update(skip_git=False, skip_pip=False, install_system=False, dry_run=False):
                 print(f"AUR package available: {format_command(command)}")
                 print("AUR packages are user-maintained; review the helper prompts before approving.")
                 if dry_run:
-                    run_checked(command, dry_run=dry_run)
+                    run_checked(command, dry_run=dry_run, system_install=True)
                 elif confirm_install_command(command):
-                    run_checked(command, dry_run=dry_run)
+                    run_checked(command, dry_run=dry_run, system_install=True)
                 else:
                     print("Skipped AUR install.")
             notes = []
