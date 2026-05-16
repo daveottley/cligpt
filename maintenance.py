@@ -7,6 +7,7 @@ import sys
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 REQUIREMENTS_FILE = os.path.join(PROJECT_ROOT, "requirements.txt")
+AUR_HELPERS = ["paru", "yay", "pikaur", "trizen"]
 
 PYTHON_REQUIREMENTS = {
     "openai": "OpenAI API client",
@@ -35,8 +36,9 @@ SYSTEM_TOOLS = [
             "dnf": ["ocrmypdf"],
             "brew": ["ocrmypdf"],
         },
+        "aur_packages": ["ocrmypdf"],
         "install_notes": {
-            "pacman": "ocrmypdf is not in the official Arch/CachyOS pacman repos. Install it from AUR, for example: paru -S ocrmypdf",
+            "pacman": "ocrmypdf is not in the official Arch/CachyOS pacman repos. Install it from AUR with an AUR helper such as paru or yay.",
         },
     },
     {
@@ -121,6 +123,13 @@ def detect_package_manager():
     return None
 
 
+def detect_aur_helper():
+    for helper in AUR_HELPERS:
+        if shutil.which(helper):
+            return helper
+    return None
+
+
 def packages_for_manager(missing_tools, manager):
     packages = []
     seen = set()
@@ -148,6 +157,25 @@ def install_commands_for_manager(packages, manager):
     if manager == "brew":
         return [["brew", "install", *packages]]
     return []
+
+
+def aur_packages_for_manager(missing_tools, manager):
+    if manager != "pacman":
+        return []
+    packages = []
+    seen = set()
+    for tool in missing_tools:
+        for package in tool.get("aur_packages", []):
+            if package not in seen:
+                seen.add(package)
+                packages.append(package)
+    return packages
+
+
+def aur_install_commands(packages, helper):
+    if not packages or not helper:
+        return []
+    return [[helper, "-S", "--needed", *packages]]
 
 
 def install_notes_for_manager(missing_tools, manager):
@@ -197,18 +225,27 @@ def doctor():
         manager = detect_package_manager()
         packages = packages_for_manager(missing_tools, manager) if manager else []
         commands = install_commands_for_manager(packages, manager)
+        aur_helper = detect_aur_helper() if manager == "pacman" else None
+        aur_packages = aur_packages_for_manager(missing_tools, manager)
+        aur_commands = aur_install_commands(aur_packages, aur_helper)
         notes = install_notes_for_manager(missing_tools, manager)
         if commands:
             print()
             print("Suggested system install command(s):")
             for command in commands:
                 print(f"  {format_command(command)}")
+        if aur_commands:
+            print()
+            print("Suggested AUR install command(s):")
+            for command in aur_commands:
+                print(f"  {format_command(command)}")
+            notes = []
         if notes:
             print()
             print("Manual install note(s):")
             for note in notes:
                 print(f"  - {note}")
-        if not commands and not notes:
+        if not commands and not aur_commands and not notes:
             print()
             print("No supported package manager was detected; install the missing tools manually.")
     else:
@@ -222,6 +259,14 @@ def run_checked(command, *, cwd=PROJECT_ROOT, dry_run=False):
     if dry_run:
         return
     subprocess.run(command, cwd=cwd, check=True)
+
+
+def confirm_install_command(command):
+    try:
+        response = input(f"Run this AUR install command now? {format_command(command)} [y/N] ")
+    except EOFError:
+        return False
+    return response.strip().lower() in {"y", "yes"}
 
 
 def update(skip_git=False, skip_pip=False, install_system=False, dry_run=False):
@@ -244,6 +289,9 @@ def update(skip_git=False, skip_pip=False, install_system=False, dry_run=False):
         manager = detect_package_manager()
         packages = packages_for_manager(missing_tools, manager) if manager else []
         commands = install_commands_for_manager(packages, manager)
+        aur_helper = detect_aur_helper() if manager == "pacman" else None
+        aur_packages = aur_packages_for_manager(missing_tools, manager)
+        aur_commands = aur_install_commands(aur_packages, aur_helper)
         notes = install_notes_for_manager(missing_tools, manager)
         if install_system and commands:
             for command in commands:
@@ -253,12 +301,30 @@ def update(skip_git=False, skip_pip=False, install_system=False, dry_run=False):
             print("System tools are missing. Re-run with --system to install them, or run:")
             for command in commands:
                 print(f"  {format_command(command)}")
+        if install_system and aur_commands:
+            for command in aur_commands:
+                print()
+                print(f"AUR package available: {format_command(command)}")
+                print("AUR packages are user-maintained; review the helper prompts before approving.")
+                if dry_run:
+                    run_checked(command, dry_run=dry_run)
+                elif confirm_install_command(command):
+                    run_checked(command, dry_run=dry_run)
+                else:
+                    print("Skipped AUR install.")
+            notes = []
+        elif aur_commands:
+            print()
+            print("AUR package(s) are missing. Re-run with --system to install after confirmation, or run:")
+            for command in aur_commands:
+                print(f"  {format_command(command)}")
+            notes = []
         if notes:
             print()
             print("Some missing tools require manual installation:")
             for note in notes:
                 print(f"  - {note}")
-        if not commands and not notes:
+        if not commands and not aur_commands and not notes:
             print()
             print("System tools are missing, but no supported package manager was detected.")
     print()

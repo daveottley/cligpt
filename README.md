@@ -83,10 +83,10 @@ gpt update --system
 ```
 
 to also install missing system tools with the detected package manager
-(`pacman`, `apt`, `dnf`, or `brew`). This may prompt for sudo.
-Some optional tools may not exist in a distro's official repositories. On
-Arch/CachyOS, `ocrmypdf` is reported as a manual AUR install such as
-`paru -S ocrmypdf` rather than being included in the `pacman -S` command.
+(`pacman`, `apt`, `dnf`, or `brew`). This may prompt for sudo. On Arch/CachyOS,
+some optional tools may live in AUR instead of the official repositories.
+cligpt detects installed AUR helpers such as `paru` or `yay`, prints the exact
+AUR command, and installs AUR packages only after you confirm.
 
 Use a dry run to verify update and install commands without changing the system:
 
