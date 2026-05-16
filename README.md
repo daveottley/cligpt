@@ -84,6 +84,9 @@ gpt update --system
 
 to also install missing system tools with the detected package manager
 (`pacman`, `apt`, `dnf`, or `brew`). This may prompt for sudo.
+Some optional tools may not exist in a distro's official repositories. On
+Arch/CachyOS, `ocrmypdf` is reported as a manual AUR install such as
+`paru -S ocrmypdf` rather than being included in the `pacman -S` command.
 
 Use a dry run to verify update and install commands without changing the system:
 

@@ -18,6 +18,19 @@ class MaintenanceTests(unittest.TestCase):
         self.assertIn("poppler", packages)
         self.assertEqual(len(packages), len(set(packages)))
 
+    def test_pacman_packages_do_not_include_unavailable_ocrmypdf(self):
+        missing = [
+            tool for tool in maintenance.SYSTEM_TOOLS
+            if tool["name"] in {"ocrmypdf", "Tesseract OCR"}
+        ]
+
+        packages = maintenance.packages_for_manager(missing, "pacman")
+        notes = maintenance.install_notes_for_manager(missing, "pacman")
+
+        self.assertNotIn("ocrmypdf", packages)
+        self.assertIn("tesseract", packages)
+        self.assertTrue(any("paru -S ocrmypdf" in note for note in notes))
+
     def test_install_commands_for_apt_updates_then_installs(self):
         with mock.patch("os.geteuid", return_value=1000):
             commands = maintenance.install_commands_for_manager(
@@ -49,6 +62,8 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("Degraded functionality", output)
         self.assertIn("sudo pacman -S --needed", output)
+        self.assertIn("Manual install note", output)
+        self.assertIn("paru -S ocrmypdf", output)
 
     def test_update_without_system_prints_install_command(self):
         with mock.patch.object(maintenance, "run_checked") as run_checked:
@@ -64,6 +79,8 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("Re-run with --system", output)
         self.assertIn("sudo pacman -S --needed", output)
+        self.assertIn("Some missing tools require manual installation", output)
+        self.assertIn("paru -S ocrmypdf", output)
         run_checked.assert_not_called()
 
     def test_update_system_dry_run_prints_but_does_not_execute(self):
@@ -83,6 +100,7 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn((["git", "pull", "--ff-only"], True), executed)
         self.assertTrue(any(command[:3] == ["sudo", "pacman", "-S"] and dry_run for command, dry_run in executed))
+        self.assertFalse(any("ocrmypdf" in command for command, _ in executed))
 
 
 if __name__ == "__main__":

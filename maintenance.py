@@ -30,10 +30,13 @@ SYSTEM_TOOLS = [
         "commands": ["ocrmypdf"],
         "feature": "high-quality scanned-PDF OCR",
         "packages": {
-            "pacman": ["ocrmypdf"],
+            "pacman": [],
             "apt": ["ocrmypdf"],
             "dnf": ["ocrmypdf"],
             "brew": ["ocrmypdf"],
+        },
+        "install_notes": {
+            "pacman": "ocrmypdf is not in the official Arch/CachyOS pacman repos. Install it from AUR, for example: paru -S ocrmypdf",
         },
     },
     {
@@ -147,6 +150,19 @@ def install_commands_for_manager(packages, manager):
     return []
 
 
+def install_notes_for_manager(missing_tools, manager):
+    if not manager:
+        return []
+    notes = []
+    seen = set()
+    for tool in missing_tools:
+        note = tool.get("install_notes", {}).get(manager)
+        if note and note not in seen:
+            seen.add(note)
+            notes.append(note)
+    return notes
+
+
 def format_command(command):
     return " ".join(command)
 
@@ -181,12 +197,18 @@ def doctor():
         manager = detect_package_manager()
         packages = packages_for_manager(missing_tools, manager) if manager else []
         commands = install_commands_for_manager(packages, manager)
+        notes = install_notes_for_manager(missing_tools, manager)
         if commands:
             print()
             print("Suggested system install command(s):")
             for command in commands:
                 print(f"  {format_command(command)}")
-        else:
+        if notes:
+            print()
+            print("Manual install note(s):")
+            for note in notes:
+                print(f"  - {note}")
+        if not commands and not notes:
             print()
             print("No supported package manager was detected; install the missing tools manually.")
     else:
@@ -222,6 +244,7 @@ def update(skip_git=False, skip_pip=False, install_system=False, dry_run=False):
         manager = detect_package_manager()
         packages = packages_for_manager(missing_tools, manager) if manager else []
         commands = install_commands_for_manager(packages, manager)
+        notes = install_notes_for_manager(missing_tools, manager)
         if install_system and commands:
             for command in commands:
                 run_checked(command, dry_run=dry_run)
@@ -230,7 +253,12 @@ def update(skip_git=False, skip_pip=False, install_system=False, dry_run=False):
             print("System tools are missing. Re-run with --system to install them, or run:")
             for command in commands:
                 print(f"  {format_command(command)}")
-        else:
+        if notes:
+            print()
+            print("Some missing tools require manual installation:")
+            for note in notes:
+                print(f"  - {note}")
+        if not commands and not notes:
             print()
             print("System tools are missing, but no supported package manager was detected.")
     print()
