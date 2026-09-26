@@ -3,8 +3,8 @@
 import os
 
 # AI configuration
-MODEL = "gpt-5.5"
-FAST_MODEL = "gpt-4o"
+MODEL = "gpt-6-luna"
+FAST_MODEL = "gpt-6-luna"
 STREAM = True
 N = 1
 PRESENCE_PENALTY = 0
